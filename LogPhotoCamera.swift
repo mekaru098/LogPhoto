@@ -149,7 +149,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
         let settings = AVCapturePhotoSettings(
             rawPixelFormatType: rawType,
-            format: [AVVideoCodecKey: AVVideoCodecType.hevc]
+            processedFormat: [AVVideoCodecKey: AVVideoCodecType.hevc]
         )
         settings.photoQualityPrioritization = .quality
         photoOutput.capturePhoto(with: settings, delegate: self)
