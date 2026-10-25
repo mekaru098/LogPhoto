@@ -3,26 +3,32 @@ import CoreImage
 import Photos
 import UIKit
 
-/// Log Photo 試作 v0（方式A）- iPhone 16 Pro / Apple Log（第1世代）向け
+/// Log Photo v1 - iPhone 16 Pro / Apple Log（第1世代）向け
 ///
-/// 仕組み:
-/// 1. `.appleLog` を含む最大解像度のビデオフォーマットを選び activeColorSpace に設定
-/// 2. AVCaptureVideoDataOutput の最新フレームを保持
-/// 3. シャッター時にそのフレームを JPEG 化して写真ライブラリへ保存（見た目はフラットな Log）
+/// 2つの撮影モード:
+/// - 方式A (.logFrame): Apple Log のビデオフレームをシャッター時に静止画保存（v0から継続）
+/// - 方式B (.rawLog): Bayer RAW で撮影し、(1) DNG をそのまま保存、
+///   (2) RAW を現像して Log カーブ（近似）で変換した JPEG も保存する
 ///
-/// 限界（v0）:
-/// - 解像度はビデオフォーマット依存（4K想定で約8MP）
-/// - 保存 JPEG のカラースペース表記は sRGB。Log のピクセル値をそのまま入れているため
-///   見た目はフラットになるが、メタデータ上の Apple Log 表記までは保持しない（v1で対応予定）
-/// - ここ（Linux）ではコンパイル検証不可。Xcode + 実機で要検証。
+/// 方式Bの Log 変換は Apple Log の厳密な OETF ではなく近似カーブ。
+/// 厳密な Apple Log 変換は v2 で検証予定。実機での色検証も未実施（クラウドのコンパイル確認のみ）。
 final class LogPhotoCamera: NSObject, ObservableObject {
 
+    enum CaptureMode: String, CaseIterable, Identifiable {
+        case logFrame = "Logフレーム"
+        case rawLog = "RAW+Log"
+        var id: String { rawValue }
+    }
+
     @Published var appleLogAvailable = false
+    @Published var rawAvailable = false
     @Published var statusText = "準備中…"
+    @Published var mode: CaptureMode = .logFrame
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "logphoto.session")
     private let videoOutput = AVCaptureVideoDataOutput()
+    private let photoOutput = AVCapturePhotoOutput()
     private let ciContext = CIContext()
 
     private let bufferLock = NSLock()
@@ -64,13 +70,21 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
         session.beginConfiguration()
         defer { session.commitConfiguration() }
+        session.sessionPreset = .inputPriority // カスタムフォーマットを優先
         if session.canAddInput(input) { session.addInput(input) }
+
         videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
         videoOutput.alwaysDiscardsLateVideoFrames = true
         if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
         videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "logphoto.frames"))
+
+        if session.canAddOutput(photoOutput) {
+            session.addOutput(photoOutput)
+            let hasRaw = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
+            DispatchQueue.main.async { self.rawAvailable = hasRaw }
+        }
 
         if let connection = videoOutput.connection(with: .video),
            connection.isVideoRotationAngleSupported(90) {
@@ -102,7 +116,15 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - シャッター
+    // MARK: - シャッター（モードで振り分け）
+    func shutter() {
+        switch mode {
+        case .logFrame: captureLogPhoto()
+        case .rawLog: captureRawLogPhoto()
+        }
+    }
+
+    // MARK: - 方式A: Logフレーム保存
     func captureLogPhoto() {
         bufferLock.lock()
         let buffer = latestBuffer
@@ -116,6 +138,64 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             setStatus("画像の変換に失敗しました")
             return
         }
+        savePhotoData(data, completion: "Log写真を保存しました")
+    }
+
+    // MARK: - 方式B: RAW撮影
+    func captureRawLogPhoto() {
+        guard let rawType = photoOutput.availableRawPhotoPixelFormatTypes.first else {
+            setStatus("この設定では RAW 撮影できません")
+            return
+        }
+        let settings = AVCapturePhotoSettings(
+            rawPixelFormatType: rawType,
+            format: [AVVideoCodecKey: AVVideoCodecType.hevc]
+        )
+        settings.photoQualityPrioritization = .quality
+        photoOutput.capturePhoto(with: settings, delegate: self)
+        setStatus("RAW撮影中…")
+    }
+
+    /// RAW(DNG) から Log変換JPEG を作る。失敗時は nil。
+    private func makeLogJPEG(fromDNG data: Data) -> Data? {
+        guard let rawFilter = CIRAWFilter(imageData: data, identifierHint: "dng"),
+              var image = rawFilter.outputImage else { return nil }
+
+        // ハイライト側の情報を Log カーブに収めるため少し引いてから変換
+        if let exposure = CIFilter(name: "CIExposureAdjust",
+                                   parameters: [kCIInputImageKey: image, kCIInputEVKey: -1.0]),
+           let out = exposure.outputImage {
+            image = out
+        }
+
+        // Log カーブ（近似）: enc = log2(1 + x * 255) / 8
+        let kernelSource = """
+        kernel vec4 logEncode(sampler src) {
+            vec4 c = sample(src, samplerCoord(src));
+            vec3 lin = clamp(c.rgb, 0.0, 1.0);
+            vec3 enc = log2(1.0 + lin * 255.0) / 8.0;
+            return vec4(enc, c.a);
+        }
+        """
+        if let kernel = CIColorKernel(source: kernelSource),
+           let out = kernel.apply(extent: image.extent, arguments: [image]) {
+            image = out
+        } else if let controls = CIFilter(name: "CIColorControls",
+                                          parameters: [kCIInputImageKey: image,
+                                                       kCIInputSaturationKey: 0.6,
+                                                       kCIInputContrastKey: 0.8]),
+                  let out = controls.outputImage {
+            image = out // カーネルが使えない環境ではフラット化で代替
+        }
+
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        return ciContext.jpegRepresentation(of: image, colorSpace: colorSpace)
+    }
+
+    // MARK: - 保存ヘルパー
+    private func savePhotoData(_ data: Data,
+                               uniformTypeIdentifier: String? = nil,
+                               completion message: String) {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
             guard status == .authorized || status == .limited else {
                 self?.setStatus("写真への保存が許可されていません")
@@ -123,9 +203,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             }
             PHPhotoLibrary.shared().performChanges {
                 let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, data: data, options: nil)
+                let options = PHAssetResourceCreationOptions()
+                options.uniformTypeIdentifier = uniformTypeIdentifier
+                request.addResource(with: .photo, data: data, options: options)
             } completionHandler: { ok, _ in
-                self?.setStatus(ok ? "Log写真を保存しました" : "保存に失敗しました")
+                self?.setStatus(ok ? message : "保存に失敗しました")
             }
         }
     }
@@ -135,7 +217,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     }
 }
 
-// MARK: - フレーム受信
+// MARK: - フレーム受信（方式A用）
 extension LogPhotoCamera: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
@@ -144,5 +226,29 @@ extension LogPhotoCamera: AVCaptureVideoDataOutputSampleBufferDelegate {
         bufferLock.lock()
         latestBuffer = buffer
         bufferLock.unlock()
+    }
+}
+
+// MARK: - RAW撮影の受け取り（方式B用）
+extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
+    func photoOutput(_ output: AVCapturePhotoOutput,
+                     didFinishProcessingPhoto photo: AVCapturePhoto,
+                     error: Error?) {
+        if error != nil { setStatus("RAW撮影に失敗しました"); return }
+        guard let data = photo.fileDataRepresentation() else {
+            setStatus("RAWデータが取得できませんでした")
+            return
+        }
+        if photo.isRawPhoto {
+            // (1) DNG そのまま保存 (2) Log変換JPEGも保存
+            savePhotoData(data,
+                          uniformTypeIdentifier: "com.adobe.raw-image",
+                          completion: "DNG（RAW）を保存しました")
+            if let jpeg = makeLogJPEG(fromDNG: data) {
+                savePhotoData(jpeg, completion: "Log変換JPEGも保存しました")
+            }
+        } else {
+            savePhotoData(data, completion: "写真を保存しました")
+        }
     }
 }
