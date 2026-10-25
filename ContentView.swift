@@ -38,13 +38,24 @@ struct ContentView: View {
                     .foregroundStyle(.white)
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(.black.opacity(0.45), in: Capsule())
-                    .padding(.bottom, 16)
+                    .padding(.bottom, 12)
+
+                // 撮影モード切替（方式A / 方式B）
+                Picker("撮影モード", selection: $camera.mode) {
+                    ForEach(LogPhotoCamera.CaptureMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .colorScheme(.dark)
+                .padding(.horizontal, 40)
+                .padding(.bottom, 16)
 
                 // 下部: シャッター
                 Button {
                     flash = true
                     withAnimation(.easeOut(duration: 0.25)) { flash = false }
-                    camera.captureLogPhoto()
+                    camera.shutter()
                 } label: {
                     Circle()
                         .strokeBorder(.white, lineWidth: 4)
