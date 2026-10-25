@@ -3,15 +3,16 @@ import CoreImage
 import Photos
 import UIKit
 
-/// Log Photo v1 - iPhone 16 Pro / Apple Log（第1世代）向け
+/// Log Photo v1.1 - iPhone 16 Pro / Apple Log（第1世代）向け
 ///
 /// 2つの撮影モード:
 /// - 方式A (.logFrame): Apple Log のビデオフレームをシャッター時に静止画保存（v0から継続）
 /// - 方式B (.rawLog): Bayer RAW で撮影し、(1) DNG をそのまま保存、
 ///   (2) RAW を現像して Log カーブ（近似）で変換した JPEG も保存する
 ///
+/// v1.1 では撮影時の露出補正（-2EV〜+2EV）を追加。
 /// 方式Bの Log 変換は Apple Log の厳密な OETF ではなく近似カーブ。
-/// 厳密な Apple Log 変換は v2 で検証予定。実機での色検証も未実施（クラウドのコンパイル確認のみ）。
+/// 厳密な Apple Log 変換と実機での色検証は今後の課題（現在はクラウドのコンパイル確認のみ）。
 final class LogPhotoCamera: NSObject, ObservableObject {
 
     enum CaptureMode: String, CaseIterable, Identifiable {
@@ -24,12 +25,14 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     @Published var rawAvailable = false
     @Published var statusText = "準備中…"
     @Published var mode: CaptureMode = .logFrame
+    @Published var exposureCompensation: Double = 0
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "logphoto.session")
     private let videoOutput = AVCaptureVideoDataOutput()
     private let photoOutput = AVCapturePhotoOutput()
     private let ciContext = CIContext()
+    private var captureDevice: AVCaptureDevice?
 
     private let bufferLock = NSLock()
     private var latestBuffer: CVPixelBuffer?
@@ -67,6 +70,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             setStatus("カメラが見つかりません")
             return
         }
+        captureDevice = device
 
         session.beginConfiguration()
         defer { session.commitConfiguration() }
@@ -113,6 +117,20 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             device.unlockForConfiguration()
         } catch {
             setStatus("カメラ設定に失敗しました")
+        }
+    }
+
+    // MARK: - 露出補正
+    /// カメラの露出ターゲットをずらす。Log撮影時の露出決めに使う想定。
+    func applyExposureCompensation(_ ev: Double) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else { return }
+            let clamped = max(Double(device.minExposureTargetBias),
+                              min(Double(device.maxExposureTargetBias), ev))
+            device.setExposureTargetBias(Float(clamped), completionHandler: nil)
+            if abs(self.exposureCompensation - clamped) > 0.001 {
+                DispatchQueue.main.async { self.exposureCompensation = clamped }
+            }
         }
     }
 
