@@ -4,6 +4,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var camera = LogPhotoCamera()
     @State private var flash = false
+    @State private var showGrid = true
 
     var body: some View {
         ZStack {
@@ -11,6 +12,11 @@ struct ContentView: View {
 
             CameraPreviewView(session: camera.session)
                 .ignoresSafeArea()
+
+            if showGrid {
+                RuleOfThirdsGrid()
+                    .ignoresSafeArea()
+            }
 
             if flash {
                 Color.white.ignoresSafeArea()
@@ -39,6 +45,39 @@ struct ContentView: View {
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(.black.opacity(0.45), in: Capsule())
                     .padding(.bottom, 12)
+
+                // 構図グリッドと露出補正（Log撮影の露出決め用）
+                HStack(spacing: 12) {
+                    Button {
+                        showGrid.toggle()
+                    } label: {
+                        Text(showGrid ? "グリッド ON" : "グリッド OFF")
+                            .font(.caption.bold())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 10).padding(.vertical, 7)
+                            .background(.black.opacity(0.45), in: Capsule())
+                    }
+
+                    Text("露出")
+                        .font(.caption.bold())
+                        .foregroundStyle(.white)
+
+                    Slider(value: Binding(
+                        get: { camera.exposureCompensation },
+                        set: { newValue in
+                            camera.exposureCompensation = newValue
+                            camera.applyExposureCompensation(newValue)
+                        }
+                    ), in: -2...2, step: 0.1)
+                    .tint(.white)
+
+                    Text(String(format: "%+.1f EV", camera.exposureCompensation))
+                        .font(.caption.monospacedDigit().bold())
+                        .foregroundStyle(.white)
+                        .frame(width: 58, alignment: .trailing)
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 12)
 
                 // 撮影モード切替（方式A / 方式B）
                 Picker("撮影モード", selection: $camera.mode) {
@@ -71,6 +110,25 @@ struct ContentView: View {
         .onDisappear {
             camera.stop()
         }
+    }
+}
+
+private struct RuleOfThirdsGrid: View {
+    var body: some View {
+        GeometryReader { geometry in
+            Path { path in
+                let width = geometry.size.width
+                let height = geometry.size.height
+                for fraction in [CGFloat(1) / 3, CGFloat(2) / 3] {
+                    path.move(to: CGPoint(x: width * fraction, y: 0))
+                    path.addLine(to: CGPoint(x: width * fraction, y: height))
+                    path.move(to: CGPoint(x: 0, y: height * fraction))
+                    path.addLine(to: CGPoint(x: width, y: height * fraction))
+                }
+            }
+            .stroke(.white.opacity(0.35), lineWidth: 1)
+        }
+        .allowsHitTesting(false)
     }
 }
 
