@@ -105,6 +105,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private let videoOutput = AVCaptureVideoDataOutput()
     private let photoOutput = AVCapturePhotoOutput()
     private let ciContext = CIContext()
+    /// RAW→Log 変換専用（中間結果をキャッシュせずメモリを抑える）
+    private let rawConvertContext = CIContext(options: [.cacheIntermediates: false])
+    private let rawConversionQueue = DispatchQueue(label: "logphoto.rawconvert", qos: .utility)
     /// 色管理変換をしないレンダリング用（Log の画素値をそのまま書き出すため）
     private let rawContext = CIContext(options: [.workingColorSpace: NSNull(),
                                                   .outputColorSpace: NSNull()])
@@ -380,6 +383,12 @@ final class LogPhotoCamera: NSObject, ObservableObject {
            (try? device.lockForConfiguration()) != nil {
             device.activeColorSpace = .appleLog
             device.unlockForConfiguration()
+        }
+        // レンズを切り替えた直後は AF/AE を明示的に連続オートへ（望遠で AF が動かない対策）
+        if !manualMode {
+            resetContinuousAutoFocus(device)
+        } else {
+            applyManualSettings()
         }
         let rangeFormat = device.activeFormat
         let isoLo = Double(rangeFormat.minISO)
@@ -864,9 +873,14 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         do {
             try device.lockForConfiguration()
             let center = CGPoint(x: 0.5, y: 0.5)
+            if device.isAutoFocusRangeRestrictionSupported {
+                device.autoFocusRangeRestriction = .none
+            }
             if device.isFocusPointOfInterestSupported { device.focusPointOfInterest = center }
             if device.isFocusModeSupported(.continuousAutoFocus) {
                 device.focusMode = .continuousAutoFocus
+            } else if device.isFocusModeSupported(.autoFocus) {
+                device.focusMode = .autoFocus
             }
             if device.isExposurePointOfInterestSupported { device.exposurePointOfInterest = center }
             if device.isExposureModeSupported(.continuousAutoExposure) {
@@ -1024,14 +1038,14 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             }
             self.pendingRawZoom = self.captureDevice?.videoZoomFactor ?? 1
             let settings = AVCapturePhotoSettings(rawPixelFormatType: rawType)
-            settings.photoQualityPrioritization = .quality
+            settings.photoQualityPrioritization = .balanced
             self.photoOutput.capturePhoto(with: settings, delegate: self)
             self.setStatus("RAW撮影中…")
         }
     }
 
     /// RAW(DNG) から Log変換画像（JPEG / TIFF）を作る。LUT 選択時は適用する。失敗時は nil。
-    private func makeLogImageData(fromDNG data: Data) -> Data? {
+    private func makeLogImageData(fromDNG data: Data, format: OutputFormat) -> Data? {
         guard let rawFilter = CIRAWFilter(imageData: data, identifierHint: "dng"),
               var image = rawFilter.outputImage else { return nil }
 
@@ -1070,28 +1084,29 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         image = applyLUT(to: image)
 
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-        switch outputFormat {
+        switch format {
         case .jpeg:
-            return ciContext.jpegRepresentation(of: image, colorSpace: colorSpace)
+            return rawConvertContext.jpegRepresentation(of: image, colorSpace: colorSpace)
         case .tiff:
-            return ciContext.tiffRepresentation(of: image, format: .RGBA16,
-                                                colorSpace: colorSpace)
+            return rawConvertContext.tiffRepresentation(of: image, format: .RGBA16,
+                                                        colorSpace: colorSpace)
         }
     }
 
     // MARK: - 保存ヘルパー
+    /// サムネイルは必ず縮小版だけを作る。UIImage(data:) で全体をデコードすると
+    /// 12MP の 16bit TIFF や DNG では数百 MB になり、メモリ不足で落ちる原因になる。
     private func updateThumbnail(from data: Data) {
-        var image = UIImage(data: data)
-        if image == nil,
-           let source = CGImageSourceCreateWithData(data as CFData, nil),
-           let cgThumb = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-               kCGImageSourceCreateThumbnailFromImageAlways: true,
-               kCGImageSourceThumbnailMaxPixelSize: 200
-           ] as CFDictionary) {
-            image = UIImage(cgImage: cgThumb)
+        autoreleasepool {
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let cgThumb = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                      kCGImageSourceCreateThumbnailFromImageAlways: true,
+                      kCGImageSourceCreateThumbnailWithTransform: true,
+                      kCGImageSourceThumbnailMaxPixelSize: 240
+                  ] as CFDictionary) else { return }
+            let image = UIImage(cgImage: cgThumb)
+            DispatchQueue.main.async { self.lastThumbnail = image }
         }
-        guard let image else { return }
-        DispatchQueue.main.async { self.lastThumbnail = image }
     }
 
     private func savePhotoData(_ data: Data,
@@ -1157,13 +1172,22 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
             savePhotoData(data,
                           uniformTypeIdentifier: "com.adobe.raw-image",
                           completion: "DNG（RAW）を保存しました")
-            if let converted = makeLogImageData(fromDNG: data) {
-                updateThumbnail(from: converted)
-                savePhotoData(converted, completion: outputFormat == .tiff
-                    ? "Log変換TIFFも保存しました"
-                    : "Log変換JPEGも保存しました")
-            } else {
-                updateThumbnail(from: data)
+            updateThumbnail(from: data)
+            setStatus("DNG を保存。Log 変換中…")
+            // 変換は重い（CIRAWFilter）ので撮影コールバックから外し、1 回ずつ直列に行う
+            let format = outputFormat
+            rawConversionQueue.async { [weak self] in
+                guard let self else { return }
+                autoreleasepool {
+                    if let converted = self.makeLogImageData(fromDNG: data, format: format) {
+                        self.updateThumbnail(from: converted)
+                        self.savePhotoData(converted, completion: format == .tiff
+                            ? "Log変換TIFFも保存しました"
+                            : "Log変換JPEGも保存しました")
+                    } else {
+                        self.setStatus("DNG は保存。Log 変換は失敗しました")
+                    }
+                }
             }
         } else {
             updateThumbnail(from: data)
