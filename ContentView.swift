@@ -2,18 +2,27 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+/// v1.12 の画面構成（純正カメラ寄り）:
+/// - 倍率チップ（0.5 / 1x / 2 / 5）はシャッターの上に常時表示。チップ上を左右にドラッグ、
+///   またはプレビューをピンチすると、その間だけスライダーが現れて 1.5 秒後に自動で消える。
+/// - 倍率と AF 状態の読み出しは画面上部に常時表示。
+/// - 形式 / 画角 / LUT / グリッド / マクロ / 露出 / マニュアル / 撮影モードなどの細かい設定は
+///   右下の歯車ボタンで開閉するパネルに集約。
 struct ContentView: View {
     @StateObject private var camera = LogPhotoCamera()
     @State private var flash = false
     @State private var showGrid = true
     @State private var showBadges = true
-    @State private var showPanel = true
+    @State private var showPanel = false
     @State private var pinchStartZoom: CGFloat? = nil
     // 露出は UI 側 @State で持ち、onChange でカメラへ反映する
     @State private var exposureEV: Double = 0
-    // ズームスライダーは UI 側の値で完結させる（定番方式: ドラッグ中はカメラへ送るだけ）
-    @State private var zoomUI: Double = 1.0
+    // ズームスライダーは log2 スケールの UI 側の値で完結させる
+    @State private var zoomLogUI: Double = 0
     @State private var isZoomEditing = false
+    @State private var zoomSliderVisible = false
+    @State private var zoomHideTask: Task<Void, Never>? = nil
+    @State private var chipDragStartZoom: CGFloat? = nil
     @State private var focusReticle: CGPoint? = nil
     @State private var reticleScale: CGFloat = 1
     @State private var showLUTImporter = false
@@ -25,8 +34,6 @@ struct ContentView: View {
                 set: { camera.selectLUT($0) })
     }
 
-
-
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -37,12 +44,19 @@ struct ContentView: View {
                     .gesture(
                         MagnificationGesture()
                             .onChanged { scale in
-                                if pinchStartZoom == nil { pinchStartZoom = camera.zoomFactor }
+                                if pinchStartZoom == nil {
+                                    pinchStartZoom = camera.zoomFactor
+                                    revealZoomSlider()
+                                }
                                 let target = (pinchStartZoom ?? 1.0) * scale
                                 camera.setZoom(target, ramp: false)
-                                zoomUI = Double(target)
+                                zoomLogUI = log2(Double(max(target, 0.01)))
+                                keepZoomSliderVisible()
                             }
-                            .onEnded { _ in pinchStartZoom = nil }
+                            .onEnded { _ in
+                                pinchStartZoom = nil
+                                scheduleZoomSliderHide()
+                            }
                     )
                     .onTapGesture { location in
                         handleFocusTap(at: location, in: geo.size)
@@ -85,55 +99,8 @@ struct ContentView: View {
             }
 
             VStack {
-                // 上部バー: バッジ（表示/非表示の切替つき）
-                HStack(spacing: 8) {
-                    if showBadges {
-                        Text(camera.appleLogAvailable ? "APPLE LOG" : "LOG 非対応")
-                            .font(.caption2.bold())
-                            .tracking(0.6)
-                            .padding(.horizontal, 9).padding(.vertical, 5)
-                            .background(.ultraThinMaterial, in: Capsule())
-                    }
-                    Spacer()
-                    if showBadges {
-                        Text("iPhone 16 Pro")
-                            .font(.caption2)
-                            .padding(.horizontal, 9).padding(.vertical, 5)
-                            .background(.ultraThinMaterial, in: Capsule())
-                    }
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) { showBadges.toggle() }
-                    } label: {
-                        Image(systemName: showBadges ? "eye" : "eye.slash")
-                            .font(.caption)
-                            .foregroundStyle(.white)
-                            .frame(width: 30, height: 30)
-                            .background(.black.opacity(0.35), in: Circle())
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.top, 10)
-
-                // 倍率とAF状態の常時表示
-                HStack {
-                    Spacer()
-                    HStack(spacing: 6) {
-                        Text(String(format: "%.1fx", camera.zoomFactor))
-                            .font(.caption.monospacedDigit().bold())
-                        Text("·")
-                            .font(.caption)
-                        Image(systemName: "crosshair")
-                            .font(.caption2)
-                        Text(camera.focusStatus)
-                            .font(.caption.bold())
-                    }
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(.black.opacity(0.45), in: Capsule())
-                    Spacer()
-                }
-                .padding(.top, 6)
-
+                topBar
+                zoomReadout
                 Spacer()
 
                 Text(camera.statusText)
@@ -147,227 +114,15 @@ struct ContentView: View {
                     manualPanel
                 }
 
-                // コントロールパネル
                 if showPanel {
-                VStack(spacing: 12) {
-                    // マニュアル・形式・LUT・画角
-                    HStack(spacing: 10) {
-                        Button {
-                            camera.setManualMode(!camera.manualMode)
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: "slider.horizontal.3")
-                                Text("マニュアル")
-                            }
-                            .font(.caption.bold())
-                            .foregroundStyle(camera.manualMode ? .black : .white)
-                            .padding(.horizontal, 11).padding(.vertical, 7)
-                            .background(camera.manualMode ? Color.white : Color.white.opacity(0.14),
-                                        in: Capsule())
-                        }
-
-                        Picker("形式", selection: $camera.outputFormat) {
-                            ForEach(LogPhotoCamera.OutputFormat.allCases) { format in
-                                Text(format.rawValue).tag(format)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .colorScheme(.dark)
-                        .frame(width: 108)
-
-                        Button {
-                            camera.setAspectFourThree(!camera.aspectFourThree)
-                        } label: {
-                            Text(camera.aspectFourThree ? "4:3" : "フル")
-                                .font(.caption.bold())
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 9).padding(.vertical, 7)
-                                .background(Color.white.opacity(0.14), in: Capsule())
-                        }
-
-                        Picker("LUT", selection: lutSelection) {
-                            ForEach(camera.lutNames, id: \.self) { name in
-                                Text(name).tag(name)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .tint(.white)
-
-                        Button {
-                            showLUTImporter = true
-                        } label: {
-                            Image(systemName: "plus.circle.fill")
-                                .font(.body)
-                                .foregroundStyle(.white)
-                        }
-                    }
-
-                    // グリッド・マクロ・露出補正
-                    HStack(spacing: 12) {
-                        Button {
-                            showGrid.toggle()
-                        } label: {
-                            Image(systemName: "grid")
-                                .font(.body)
-                                .foregroundStyle(showGrid ? .white : .white.opacity(0.4))
-                                .frame(width: 34, height: 34)
-                                .background(.white.opacity(0.12), in: Circle())
-                        }
-
-                        Button {
-                            camera.setMacroMode(!camera.macroMode)
-                        } label: {
-                            Text("マクロ")
-                                .font(.caption.bold())
-                                .foregroundStyle(camera.macroMode ? .black : .white)
-                                .padding(.horizontal, 10).padding(.vertical, 7)
-                                .background(camera.macroMode ? Color.white : Color.white.opacity(0.14),
-                                            in: Capsule())
-                        }
-
-                        Text("露出")
-                            .font(.caption.bold())
-                            .foregroundStyle(.white)
-
-                        Slider(value: $exposureEV, in: -2...2, step: 0.1)
-                            .tint(.white)
-                            .onChange(of: exposureEV) { _, newValue in
-                                camera.applyExposureCompensation(newValue)
-                            }
-
-                        Text(String(format: "%+.1f", exposureEV))
-                            .font(.caption.monospacedDigit().bold())
-                            .foregroundStyle(.white)
-                            .frame(width: 36, alignment: .trailing)
-                    }
-
-                    // 倍率ボタンとズームスライダー
-                    HStack(spacing: 14) {
-                        HStack(spacing: 7) {
-                            ForEach(camera.zoomPresets, id: \.self) { preset in
-                                let isActive = abs(camera.zoomFactor - preset) < 0.06
-                                Button {
-                                    camera.setZoom(preset)
-                                    zoomUI = Double(preset)
-                                } label: {
-                                    Text(preset == 1.0 ? "1x" : String(format: "%g", preset))
-                                        .font(.caption2.bold())
-                                        .foregroundStyle(isActive ? .black : .white)
-                                        .frame(width: 33, height: 33)
-                                        .background(isActive ? Color.white : Color.white.opacity(0.14),
-                                                    in: Circle())
-                                }
-                            }
-                        }
-
-                        Slider(value: $zoomUI,
-                               in: Double(camera.zoomRange.lowerBound)...Double(camera.zoomRange.upperBound),
-                               onEditingChanged: { editing in
-                                   isZoomEditing = editing
-                                   if !editing { zoomUI = Double(camera.zoomFactor) }
-                               })
-                            .tint(.white)
-                            .onChange(of: zoomUI) { _, newValue in
-                                if isZoomEditing {
-                                    camera.setZoom(CGFloat(newValue), ramp: false)
-                                }
-                            }
-                            .onChange(of: camera.zoomFactor) { _, newValue in
-                                if !isZoomEditing { zoomUI = Double(newValue) }
-                            }
-
-                        Text(String(format: "%.1fx", camera.zoomFactor))
-                            .font(.caption.monospacedDigit().bold())
-                            .foregroundStyle(.white)
-                            .frame(width: 40, alignment: .trailing)
-                    }
-
-                    // 撮影モード切替（方式A / 方式B）
-                    Picker("撮影モード", selection: $camera.mode) {
-                        ForEach(LogPhotoCamera.CaptureMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .colorScheme(.dark)
-                }
-                .padding(14)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
-                .overlay(RoundedRectangle(cornerRadius: 24)
-                    .stroke(.white.opacity(0.10), lineWidth: 1))
-                .overlay(alignment: .topTrailing) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) { showPanel = false }
-                    } label: {
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 24, height: 24)
-                            .background(.black.opacity(0.35), in: Circle())
-                    }
-                    .offset(x: 8, y: -10)
-                }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 12)
+                    settingsPanel
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
-                // 下部: サムネイル / シャッター
-                HStack {
-                    Button {
-                        openGallery()
-                    } label: {
-                        Group {
-                            if let thumbnail = camera.lastThumbnail {
-                                Image(uiImage: thumbnail)
-                                    .resizable()
-                                    .scaledToFill()
-                            } else {
-                                Image(systemName: "photo")
-                                    .foregroundStyle(.white.opacity(0.65))
-                            }
-                        }
-                        .frame(width: 46, height: 46)
-                        .background(.black.opacity(0.4))
-                        .clipShape(RoundedRectangle(cornerRadius: 11))
-                        .overlay(RoundedRectangle(cornerRadius: 11)
-                            .stroke(.white.opacity(0.45), lineWidth: 1))
-                    }
+                zoomControl
+                    .padding(.bottom, 14)
 
-                    Spacer()
-
-                    Button {
-                        flash = true
-                        withAnimation(.easeOut(duration: 0.25)) { flash = false }
-                        camera.shutter()
-                    } label: {
-                        Circle()
-                            .strokeBorder(.white, lineWidth: 3.5)
-                            .frame(width: 72, height: 72)
-                            .overlay(Circle().fill(.white).frame(width: 58, height: 58))
-                    }
-
-                    Spacer()
-
-                    if showPanel {
-                        Color.clear.frame(width: 46, height: 46)
-                    } else {
-                        // パネルを閉じているときは、ここから開き直せる
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.2)) { showPanel = true }
-                        } label: {
-                            Image(systemName: "slider.horizontal.3")
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .frame(width: 46, height: 46)
-                                .background(.black.opacity(0.4))
-                                .clipShape(RoundedRectangle(cornerRadius: 11))
-                                .overlay(RoundedRectangle(cornerRadius: 11)
-                                    .stroke(.white.opacity(0.45), lineWidth: 1))
-                        }
-                    }
-                }
-                .padding(.horizontal, 22)
-                .padding(.bottom, 24)
+                bottomBar
             }
         }
         .task {
@@ -387,6 +142,12 @@ struct ContentView: View {
         }
         .onChange(of: camera.mode) { _, _ in
             camera.modeChanged()
+        }
+        .onChange(of: camera.zoomFactor) { _, newValue in
+            // 操作中でなければ、カメラ側の倍率にスライダー位置を合わせる
+            if !isZoomEditing, chipDragStartZoom == nil, pinchStartZoom == nil {
+                zoomLogUI = log2(Double(max(newValue, 0.01)))
+            }
         }
         .fileImporter(isPresented: $showLUTImporter,
                       allowedContentTypes: [UTType(filenameExtension: "cube") ?? .data],
@@ -421,7 +182,368 @@ struct ContentView: View {
         }
     }
 
-    /// タップAF: プレビーの fill クロップを補正して画像上の正規化座標へ変換する。
+    // MARK: - 上部
+    private var topBar: some View {
+        HStack(spacing: 8) {
+            if showBadges {
+                Text(camera.appleLogAvailable ? "APPLE LOG" : "LOG 非対応")
+                    .font(.caption2.bold())
+                    .tracking(0.6)
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(.ultraThinMaterial, in: Capsule())
+                if camera.mode == .rawLog {
+                    Text(camera.rawAvailable ? "RAW" : "RAW 準備中")
+                        .font(.caption2.bold())
+                        .tracking(0.6)
+                        .foregroundStyle(camera.rawAvailable ? .white : .yellow)
+                        .padding(.horizontal, 9).padding(.vertical, 5)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
+            }
+            Spacer()
+            if showBadges {
+                Text("iPhone 16 Pro")
+                    .font(.caption2)
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(.ultraThinMaterial, in: Capsule())
+            }
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { showBadges.toggle() }
+            } label: {
+                Image(systemName: showBadges ? "eye" : "eye.slash")
+                    .font(.caption)
+                    .foregroundStyle(.white)
+                    .frame(width: 30, height: 30)
+                    .background(.black.opacity(0.35), in: Circle())
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
+    }
+
+    /// 倍率とAF状態の常時表示
+    private var zoomReadout: some View {
+        HStack {
+            Spacer()
+            HStack(spacing: 6) {
+                Text(zoomLabel(camera.zoomFactor))
+                    .font(.caption.monospacedDigit().bold())
+                Text("·")
+                    .font(.caption)
+                Image(systemName: "crosshair")
+                    .font(.caption2)
+                Text(camera.focusStatus)
+                    .font(.caption.bold())
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(.black.opacity(0.45), in: Capsule())
+            Spacer()
+        }
+        .padding(.top, 6)
+    }
+
+    // MARK: - ズーム操作（チップ常時表示、操作中だけスライダー）
+    private var zoomControl: some View {
+        ZStack {
+            zoomChips
+                .opacity(zoomSliderVisible ? 0 : 1)
+                .allowsHitTesting(!zoomSliderVisible)
+            zoomSliderBar
+                .opacity(zoomSliderVisible ? 1 : 0)
+                .allowsHitTesting(zoomSliderVisible)
+        }
+        .frame(height: 44)
+        .padding(.horizontal, 24)
+        .animation(.easeInOut(duration: 0.18), value: zoomSliderVisible)
+    }
+
+    /// 現在の倍率が属するプリセット（その倍率以下で最大のもの）。純正と同じ見せ方。
+    private var activePreset: CGFloat? {
+        let presets = camera.zoomPresets
+        return presets.last(where: { $0 <= camera.zoomFactor + 0.001 }) ?? presets.first
+    }
+
+    private var zoomChips: some View {
+        HStack(spacing: 6) {
+            ForEach(camera.zoomPresets, id: \.self) { preset in
+                let isActive = activePreset == preset
+                let showsLive = isActive && abs(camera.zoomFactor - preset) > 0.05
+                Button {
+                    camera.setZoom(preset, ramp: true, switchLensNow: true)
+                    zoomLogUI = log2(Double(preset))
+                } label: {
+                    Text(showsLive ? zoomLabel(camera.zoomFactor) : presetLabel(preset))
+                        .font(.system(size: isActive ? 12 : 11, weight: .bold).monospacedDigit())
+                        .foregroundStyle(isActive ? .yellow : .white)
+                        .frame(minWidth: 34)
+                        .frame(height: 34)
+                        .padding(.horizontal, isActive ? 6 : 0)
+                        .background(isActive ? Color.black.opacity(0.6) : Color.black.opacity(0.3),
+                                    in: Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(5)
+        .background(.black.opacity(0.3), in: Capsule())
+        // チップの上を左右にドラッグすると倍率が変わり、スライダーが出る（純正風）
+        .highPriorityGesture(
+            DragGesture(minimumDistance: 12)
+                .onChanged { value in
+                    if chipDragStartZoom == nil {
+                        chipDragStartZoom = camera.zoomFactor
+                        revealZoomSlider()
+                    }
+                    let start = chipDragStartZoom ?? 1
+                    let target = start * CGFloat(pow(2.0, Double(value.translation.width) / 110))
+                    camera.setZoom(target, ramp: false)
+                    zoomLogUI = log2(Double(max(target, 0.01)))
+                    keepZoomSliderVisible()
+                }
+                .onEnded { _ in
+                    chipDragStartZoom = nil
+                    scheduleZoomSliderHide()
+                }
+        )
+    }
+
+    private var zoomSliderBar: some View {
+        let lo = log2(Double(max(camera.zoomRange.lowerBound, 0.01)))
+        let hi = max(log2(Double(max(camera.zoomRange.upperBound, 0.01))), lo + 0.01)
+        return HStack(spacing: 10) {
+            Text(presetLabel(camera.zoomRange.lowerBound))
+                .font(.caption2.bold().monospacedDigit())
+                .foregroundStyle(.white.opacity(0.8))
+            Slider(value: $zoomLogUI, in: lo...hi,
+                   onEditingChanged: { editing in
+                       isZoomEditing = editing
+                       if editing {
+                           keepZoomSliderVisible()
+                       } else {
+                           scheduleZoomSliderHide()
+                       }
+                   })
+                .tint(.yellow)
+                .onChange(of: zoomLogUI) { _, newValue in
+                    if isZoomEditing {
+                        camera.setZoom(CGFloat(pow(2.0, newValue)), ramp: false)
+                        keepZoomSliderVisible()
+                    }
+                }
+            Text(zoomLabel(camera.zoomFactor))
+                .font(.caption.monospacedDigit().bold())
+                .foregroundStyle(.yellow)
+                .frame(width: 44, alignment: .trailing)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 5)
+        .background(.black.opacity(0.45), in: Capsule())
+    }
+
+    private func revealZoomSlider() {
+        zoomHideTask?.cancel()
+        zoomHideTask = nil
+        withAnimation(.easeInOut(duration: 0.18)) { zoomSliderVisible = true }
+    }
+
+    /// 操作が続いている間は消さない（消えるタイマーを取り消す）。
+    private func keepZoomSliderVisible() {
+        zoomHideTask?.cancel()
+        zoomHideTask = nil
+        if !zoomSliderVisible {
+            withAnimation(.easeInOut(duration: 0.18)) { zoomSliderVisible = true }
+        }
+    }
+
+    /// 最後の操作から 1.5 秒後にスライダーをしまう。
+    private func scheduleZoomSliderHide(after seconds: Double = 1.5) {
+        zoomHideTask?.cancel()
+        zoomHideTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.25)) { zoomSliderVisible = false }
+        }
+    }
+
+    private func presetLabel(_ preset: CGFloat) -> String {
+        if abs(preset - 1) < 0.001 { return "1x" }
+        if abs(preset - preset.rounded()) < 0.001 { return String(format: "%.0f", preset) }
+        return String(format: "%g", preset)
+    }
+
+    private func zoomLabel(_ zoom: CGFloat) -> String {
+        if zoom >= 10 { return String(format: "%.0fx", zoom) }
+        return String(format: "%.1fx", zoom)
+    }
+
+    // MARK: - 下部: サムネイル / シャッター / 設定
+    private var bottomBar: some View {
+        HStack {
+            Button {
+                openGallery()
+            } label: {
+                Group {
+                    if let thumbnail = camera.lastThumbnail {
+                        Image(uiImage: thumbnail)
+                            .resizable()
+                            .scaledToFill()
+                    } else {
+                        Image(systemName: "photo")
+                            .foregroundStyle(.white.opacity(0.65))
+                    }
+                }
+                .frame(width: 46, height: 46)
+                .background(.black.opacity(0.4))
+                .clipShape(RoundedRectangle(cornerRadius: 11))
+                .overlay(RoundedRectangle(cornerRadius: 11)
+                    .stroke(.white.opacity(0.45), lineWidth: 1))
+            }
+
+            Spacer()
+
+            Button {
+                flash = true
+                withAnimation(.easeOut(duration: 0.25)) { flash = false }
+                camera.shutter()
+            } label: {
+                Circle()
+                    .strokeBorder(.white, lineWidth: 3.5)
+                    .frame(width: 72, height: 72)
+                    .overlay(Circle().fill(.white).frame(width: 58, height: 58))
+            }
+
+            Spacer()
+
+            // 右下の設定ボタン: 細かい設定パネルの開閉
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { showPanel.toggle() }
+            } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(showPanel ? .black : .white)
+                    .frame(width: 46, height: 46)
+                    .background(showPanel ? Color.white : Color.black.opacity(0.4))
+                    .clipShape(RoundedRectangle(cornerRadius: 11))
+                    .overlay(RoundedRectangle(cornerRadius: 11)
+                        .stroke(.white.opacity(0.45), lineWidth: 1))
+            }
+        }
+        .padding(.horizontal, 22)
+        .padding(.bottom, 24)
+    }
+
+    // MARK: - 設定パネル（歯車で開閉）
+    private var settingsPanel: some View {
+        VStack(spacing: 12) {
+            // マニュアル・形式・画角・LUT
+            HStack(spacing: 10) {
+                Button {
+                    camera.setManualMode(!camera.manualMode)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "slider.horizontal.3")
+                        Text("マニュアル")
+                    }
+                    .font(.caption.bold())
+                    .foregroundStyle(camera.manualMode ? .black : .white)
+                    .padding(.horizontal, 11).padding(.vertical, 7)
+                    .background(camera.manualMode ? Color.white : Color.white.opacity(0.14),
+                                in: Capsule())
+                }
+
+                Picker("形式", selection: $camera.outputFormat) {
+                    ForEach(LogPhotoCamera.OutputFormat.allCases) { format in
+                        Text(format.rawValue).tag(format)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .colorScheme(.dark)
+                .frame(width: 108)
+
+                Button {
+                    camera.setAspectFourThree(!camera.aspectFourThree)
+                } label: {
+                    Text(camera.aspectFourThree ? "4:3" : "フル")
+                        .font(.caption.bold())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 9).padding(.vertical, 7)
+                        .background(Color.white.opacity(0.14), in: Capsule())
+                }
+
+                Picker("LUT", selection: lutSelection) {
+                    ForEach(camera.lutNames, id: \.self) { name in
+                        Text(name).tag(name)
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(.white)
+
+                Button {
+                    showLUTImporter = true
+                } label: {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.body)
+                        .foregroundStyle(.white)
+                }
+            }
+
+            // グリッド・マクロ・露出補正
+            HStack(spacing: 12) {
+                Button {
+                    showGrid.toggle()
+                } label: {
+                    Image(systemName: "grid")
+                        .font(.body)
+                        .foregroundStyle(showGrid ? .white : .white.opacity(0.4))
+                        .frame(width: 34, height: 34)
+                        .background(.white.opacity(0.12), in: Circle())
+                }
+
+                Button {
+                    camera.setMacroMode(!camera.macroMode)
+                } label: {
+                    Text("マクロ")
+                        .font(.caption.bold())
+                        .foregroundStyle(camera.macroMode ? .black : .white)
+                        .padding(.horizontal, 10).padding(.vertical, 7)
+                        .background(camera.macroMode ? Color.white : Color.white.opacity(0.14),
+                                    in: Capsule())
+                }
+
+                Text("露出")
+                    .font(.caption.bold())
+                    .foregroundStyle(.white)
+
+                Slider(value: $exposureEV, in: -2...2, step: 0.1)
+                    .tint(.white)
+                    .onChange(of: exposureEV) { _, newValue in
+                        camera.applyExposureCompensation(newValue)
+                    }
+
+                Text(String(format: "%+.1f", exposureEV))
+                    .font(.caption.monospacedDigit().bold())
+                    .foregroundStyle(.white)
+                    .frame(width: 36, alignment: .trailing)
+            }
+
+            // 撮影モード切替（方式A / 方式B）
+            Picker("撮影モード", selection: $camera.mode) {
+                ForEach(LogPhotoCamera.CaptureMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .colorScheme(.dark)
+        }
+        .padding(14)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
+        .overlay(RoundedRectangle(cornerRadius: 24)
+            .stroke(.white.opacity(0.10), lineWidth: 1))
+        .padding(.horizontal, 12)
+        .padding(.bottom, 12)
+    }
+
+    /// タップAF: プレビューの fill クロップを補正して画像上の正規化座標へ変換する。
     private func handleFocusTap(at location: CGPoint, in size: CGSize) {
         let frame = camera.previewFrameSize
         guard frame.width > 0, frame.height > 0, size.width > 0, size.height > 0 else { return }
@@ -551,4 +673,3 @@ private struct RuleOfThirdsGrid: View {
 #Preview {
     ContentView()
 }
-
