@@ -11,7 +11,11 @@ struct ContentView: View {
     @State private var pinchStartZoom: CGFloat? = nil
     // 露出は UI 側 @State で持ち、onChange でカメラへ反映する
     @State private var exposureEV: Double = 0
+    // ズームスライダーは UI 側の値で完結させる（定番方式: ドラッグ中はカメラへ送るだけ）
+    @State private var zoomUI: Double = 1.0
+    @State private var isZoomEditing = false
     @State private var focusReticle: CGPoint? = nil
+    @State private var reticleScale: CGFloat = 1
     @State private var showLUTImporter = false
     @State private var showLastPhoto = false
     @State private var shutterLog: Double = -6
@@ -21,11 +25,7 @@ struct ContentView: View {
                 set: { camera.selectLUT($0) })
     }
 
-    /// ズームスライダーはカメラの値へ直接つなぐ（往復の同期ループを作らない）。
-    private var zoomBinding: Binding<Double> {
-        Binding(get: { Double(camera.zoomFactor) },
-                set: { camera.setZoom(CGFloat($0), ramp: false) })
-    }
+
 
     var body: some View {
         ZStack {
@@ -38,7 +38,9 @@ struct ContentView: View {
                         MagnificationGesture()
                             .onChanged { scale in
                                 if pinchStartZoom == nil { pinchStartZoom = camera.zoomFactor }
-                                camera.setZoom((pinchStartZoom ?? 1.0) * scale, ramp: false)
+                                let target = (pinchStartZoom ?? 1.0) * scale
+                                camera.setZoom(target, ramp: false)
+                                zoomUI = Double(target)
                             }
                             .onEnded { _ in pinchStartZoom = nil }
                     )
@@ -73,6 +75,7 @@ struct ContentView: View {
                 RoundedRectangle(cornerRadius: 6)
                     .stroke(Color.yellow, lineWidth: 1.5)
                     .frame(width: 72, height: 72)
+                    .scaleEffect(reticleScale)
                     .position(point)
                     .allowsHitTesting(false)
             }
@@ -110,6 +113,26 @@ struct ContentView: View {
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, 10)
+
+                // 倍率とAF状態の常時表示
+                HStack {
+                    Spacer()
+                    HStack(spacing: 6) {
+                        Text(String(format: "%.1fx", camera.zoomFactor))
+                            .font(.caption.monospacedDigit().bold())
+                        Text("·")
+                            .font(.caption)
+                        Image(systemName: "crosshair")
+                            .font(.caption2)
+                        Text(camera.focusStatus)
+                            .font(.caption.bold())
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(.black.opacity(0.45), in: Capsule())
+                    Spacer()
+                }
+                .padding(.top, 6)
 
                 Spacer()
 
@@ -225,6 +248,7 @@ struct ContentView: View {
                                 let isActive = abs(camera.zoomFactor - preset) < 0.06
                                 Button {
                                     camera.setZoom(preset)
+                                    zoomUI = Double(preset)
                                 } label: {
                                     Text(preset == 1.0 ? "1x" : String(format: "%g", preset))
                                         .font(.caption2.bold())
@@ -236,9 +260,21 @@ struct ContentView: View {
                             }
                         }
 
-                        Slider(value: zoomBinding,
-                               in: Double(camera.zoomRange.lowerBound)...Double(camera.zoomRange.upperBound))
+                        Slider(value: $zoomUI,
+                               in: Double(camera.zoomRange.lowerBound)...Double(camera.zoomRange.upperBound),
+                               onEditingChanged: { editing in
+                                   isZoomEditing = editing
+                                   if !editing { zoomUI = Double(camera.zoomFactor) }
+                               })
                             .tint(.white)
+                            .onChange(of: zoomUI) { _, newValue in
+                                if isZoomEditing {
+                                    camera.setZoom(CGFloat(newValue), ramp: false)
+                                }
+                            }
+                            .onChange(of: camera.zoomFactor) { _, newValue in
+                                if !isZoomEditing { zoomUI = Double(newValue) }
+                            }
 
                         Text(String(format: "%.1fx", camera.zoomFactor))
                             .font(.caption.monospacedDigit().bold())
@@ -402,8 +438,10 @@ struct ContentView: View {
         }
         camera.focusAt(previewPoint: CGPoint(x: u, y: v))
         focusReticle = location
+        reticleScale = 1.3
+        withAnimation(.easeOut(duration: 0.25)) { reticleScale = 1.0 }
         Task {
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
             focusReticle = nil
         }
     }

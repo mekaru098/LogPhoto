@@ -4,7 +4,14 @@ import ImageIO
 import Photos
 import UIKit
 
-/// Log Photo v1.10 - iPhone 16 Pro / Apple Log（第1世代）向け
+/// Log Photo v1.11 - iPhone 16 Pro / Apple Log（第1世代）向け
+///
+/// v1.11 の変更:
+/// - ズーム操作を定番方式に作り替え: スライダーは UI 側の値で完結させ、
+///   レンズ切替（超広角⇔通常）にはヒステリシス（0.9倍で切替・1.2倍で復帰）と
+///   0.3秒のデバウンスを入れて、境界での往復切替（バグの主因）を防ぐ。
+/// - AF をワンショット方式にしてタップ位置で明確に合焦させる。倍率とAF状態を
+///   画面上部に常時表示する。
 ///
 /// v1.10 の変更:
 /// - ズームの不安定さを修正。倍率の唯一の管理値を desiredZoom（表示倍率）とし、
@@ -122,10 +129,12 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private var captureDevice: AVCaptureDevice?  // 現在の入力デバイス
     private var displayScale: CGFloat = 1        // 表示倍率 = デバイス倍率 × scale
     private var desiredZoom: CGFloat = 1         // 倍率の唯一の管理値（表示倍率）
+    private var zoomSwitchToken = 0              // レンズ切替デバウンス用
     private var lastFrameWidth = 0
     private var lastFrameHeight = 0
     @Published var macroMode = false
     @Published var previewFrameSize: CGSize = .zero
+    @Published var focusStatus = "AF 自動"
     private var rawSetupInFlight = false
     private var rawUsesPhotoPreset = false
     private var pendingRawZoom: CGFloat = 1
@@ -257,6 +266,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 self.maxZoomFactor = maxZoom
                 self.displayScale = scale
+                self.focusStatus = "AF 自動"
                 self.zoomPresets = presets.isEmpty ? [1.0] : presets
                 self.zoomRange = rangeLower...(maxZoom * scale)
                 if isoHi > isoLo { self.isoRange = isoLo...isoHi }
@@ -276,7 +286,10 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     /// RAW は広角の実カメラ、マクロ/0.5倍は超広角、マニュアルは広角の実カメラ。
     private func desiredDevice() -> AVCaptureDevice? {
         if mode == .rawLog { return physicalDevice ?? virtualDevice }
-        if (macroMode || desiredZoom < 0.99), mode == .logFrame, let uw = ultraWideDevice {
+        // レンズ切替にはヒステリシスを持たせる（境界での往復防止）
+        let onUltraWide = captureDevice?.deviceType == .builtInUltraWideCamera
+        let wantsUltraWide = onUltraWide ? desiredZoom < 1.2 : desiredZoom < 0.9
+        if (macroMode || wantsUltraWide), mode == .logFrame, let uw = ultraWideDevice {
             return uw
         }
         if manualMode { return physicalDevice ?? virtualDevice }
@@ -595,12 +608,25 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     /// 倍率ボタンは ramp で滑らかに、ピンチ/スライダーは ramp なしで即時に反映する。
     /// ズームの唯一の入口。表示倍率で desiredZoom を更新し、必要ならデバイスを
     /// 切り替えてから、現在のデバイスへ倍率を適用する。
+    /// レンズ切替が絡むときだけ 0.3 秒待ってから切り替える（デバウンス）:
+    /// スライダーやピンチで境界を往復しても切替が暴走しない。
     func setZoom(_ factor: CGFloat, ramp: Bool = true) {
         sessionQueue.async { [weak self] in
             guard let self else { return }
             let lower: CGFloat = self.ultraWideDevice != nil ? 0.5 : 1.0
             self.desiredZoom = min(max(factor, lower), 15)
-            self.reconcileInput()
+            let needsLensSwitch = self.desiredDevice() != self.captureDevice
+            if needsLensSwitch, self.mode == .logFrame, !self.macroMode {
+                self.zoomSwitchToken += 1
+                let token = self.zoomSwitchToken
+                self.sessionQueue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    guard let self, self.zoomSwitchToken == token else { return }
+                    self.reconcileInput()
+                    self.applyDesiredZoom(ramp: false)
+                }
+            } else {
+                self.reconcileInput()
+            }
             self.applyDesiredZoom(ramp: ramp)
         }
     }
@@ -646,21 +672,23 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 try device.lockForConfiguration()
                 if device.isFocusPointOfInterestSupported {
                     device.focusPointOfInterest = devicePoint
-                    if device.isFocusModeSupported(.continuousAutoFocus) {
-                        device.focusMode = .continuousAutoFocus
-                    } else if device.isFocusModeSupported(.autoFocus) {
+                    // ワンショットで明確に合わせる（純正のタップAFと同じ方式）
+                    if device.isFocusModeSupported(.autoFocus) {
                         device.focusMode = .autoFocus
+                    } else if device.isFocusModeSupported(.continuousAutoFocus) {
+                        device.focusMode = .continuousAutoFocus
                     }
                 }
                 if device.isExposurePointOfInterestSupported {
                     device.exposurePointOfInterest = devicePoint
-                    if device.isExposureModeSupported(.continuousAutoExposure) {
-                        device.exposureMode = .continuousAutoExposure
-                    } else if device.isExposureModeSupported(.autoExpose) {
+                    if device.isExposureModeSupported(.autoExpose) {
                         device.exposureMode = .autoExpose
+                    } else if device.isExposureModeSupported(.continuousAutoExposure) {
+                        device.exposureMode = .continuousAutoExposure
                     }
                 }
                 device.unlockForConfiguration()
+                DispatchQueue.main.async { self.focusStatus = "AF（タップ位置）" }
             } catch { }
         }
     }
