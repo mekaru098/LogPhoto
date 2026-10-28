@@ -656,8 +656,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                     device.exposurePointOfInterest = devicePoint
                     if device.isExposureModeSupported(.continuousAutoExposure) {
                         device.exposureMode = .continuousAutoExposure
-                    } else if device.isExposureModeSupported(.autoExposure) {
-                        device.exposureMode = .autoExposure
+                    } else if device.isExposureModeSupported(.autoExpose) {
+                        device.exposureMode = .autoExpose
                     }
                 }
                 device.unlockForConfiguration()
