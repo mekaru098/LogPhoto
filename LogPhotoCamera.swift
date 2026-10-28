@@ -4,7 +4,13 @@ import ImageIO
 import Photos
 import UIKit
 
-/// Log Photo v1.8 - iPhone 16 Pro / Apple Log（第1世代）向け
+/// Log Photo v1.9 - iPhone 16 Pro / Apple Log（第1世代）向け
+///
+/// v1.9 の変更:
+/// - デザインを v1.7 の見た目に戻した（v1.8 のクラシック調は不採用）。
+/// - マクロ機能を追加（超広角カメラへ切り替えて近距離にピントを合わせる）。
+/// - 0.5倍を追加（超広角カメラへの切替えで実現。表示倍率はレンズ基準で統一し、
+///   超広角ではデバイス倍率×0.5 を表示する）。
 ///
 /// v1.8 の変更:
 /// - RAW+Log の倍率がプレビューと一致しない問題を修正。静止画側のズームは
@@ -105,7 +111,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     private var virtualDevice: AVCaptureDevice?  // トリプル/デュアル（ズーム用）
     private var physicalDevice: AVCaptureDevice? // 広角の実カメラ（マニュアル/RAW用）
+    private var ultraWideDevice: AVCaptureDevice? // 超広角の実カメラ（0.5倍/マクロ用）
     private var captureDevice: AVCaptureDevice?  // 現在の入力デバイス
+    private var ultraWideActive = false          // 0.5倍で超広角を使用中
+    private var displayScale: CGFloat = 1        // 表示倍率 = デバイス倍率 × scale
+    @Published var macroMode = false
     private var rawSetupInFlight = false
     private var rawUsesPhotoPreset = false
     private var pendingRawZoom: CGFloat = 1
@@ -150,6 +160,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         physicalDevice = AVCaptureDevice.default(.builtInWideAngleCamera,
                                                  for: .video, position: .back)
         if physicalDevice == nil { physicalDevice = discovery.devices.first }
+        ultraWideDevice = AVCaptureDevice.default(.builtInUltraWideCamera,
+                                                  for: .video, position: .back)
         // 仮想デバイスに Log がなければ最初から実カメラを使う
         var startDevice = virtualDevice ?? physicalDevice
         if let candidate = startDevice,
@@ -210,11 +222,18 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             } else {
                 setStatus("この機種/レンズは Apple Log 非対応です")
             }
+            // 表示倍率はレンズ基準: 超広角ではデバイス倍率×0.5 を表示する
+            let scale: CGFloat = device.deviceType == .builtInUltraWideCamera ? 0.5 : 1
             let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 15.0)
-            let presets = [CGFloat(0.5), 1.0, 2.0, 5.0].filter {
-                $0 >= device.minAvailableVideoZoomFactor - 0.001 && $0 <= maxZoom
+            var presets = [CGFloat(0.5), 1.0, 2.0, 5.0].filter { display in
+                let dev = display / scale
+                return dev >= device.minAvailableVideoZoomFactor - 0.001 && dev <= maxZoom
             }
-            let initialZoom = device.videoZoomFactor
+            // 超広角へ切り替えれば 0.5倍も選べるようにする
+            if scale == 1, ultraWideDevice != nil, !presets.contains(0.5) {
+                presets.insert(0.5, at: 0)
+            }
+            let initialZoom = device.videoZoomFactor * scale
             let rangeFormat = logFormat ?? device.activeFormat
             let isoLo = Double(rangeFormat.minISO)
             let isoHi = Double(rangeFormat.maxISO)
@@ -224,9 +243,10 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             let currentSS = device.exposureDuration.seconds
             DispatchQueue.main.async {
                 self.maxZoomFactor = maxZoom
+                self.displayScale = scale
                 self.zoomPresets = presets.isEmpty ? [1.0] : presets
                 self.zoomFactor = initialZoom
-                self.zoomRange = device.minAvailableVideoZoomFactor...maxZoom
+                self.zoomRange = (device.minAvailableVideoZoomFactor * scale)...(maxZoom * scale)
                 if isoHi > isoLo { self.isoRange = isoLo...isoHi }
                 if ssHi > ssLo { self.shutterRange = ssLo...ssHi }
                 self.isoValue = min(max(currentISO, isoLo), isoHi)
@@ -238,8 +258,19 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
     }
 
-    /// マニュアル / RAW が必要なときは実カメラ、それ以外は仮想デバイスへ。
-    private func reconcileInput(manual: Bool, mode: CaptureMode) {
+    /// 現在の状態から使うべきデバイスを決める。
+    /// RAW は広角の実カメラ、マクロ/0.5倍は超広角、マニュアルは広角の実カメラ。
+    private func desiredDevice() -> AVCaptureDevice? {
+        if mode == .rawLog { return physicalDevice ?? virtualDevice }
+        if (macroMode || ultraWideActive), mode == .logFrame, let uw = ultraWideDevice {
+            return uw
+        }
+        if manualMode { return physicalDevice ?? virtualDevice }
+        return virtualDevice ?? physicalDevice
+    }
+
+    /// 入力を desiredDevice() に合わせる（sessionQueue 上で呼ぶ）。
+    private func reconcileInput() {
         // RAW 用に写真優先プリセットへ寄せていたら先に戻す
         if mode != .rawLog, rawUsesPhotoPreset {
             session.beginConfiguration()
@@ -247,10 +278,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             session.commitConfiguration()
             rawUsesPhotoPreset = false
         }
-        let wantsPhysical = manual || mode == .rawLog
-        let target = wantsPhysical ? (physicalDevice ?? virtualDevice)
-                                   : (virtualDevice ?? physicalDevice)
-        guard let target else { return }
+        guard let target = desiredDevice() else { return }
         if target != captureDevice {
             guard let newInput = try? AVCaptureDeviceInput(device: target) else { return }
             session.beginConfiguration()
@@ -348,10 +376,18 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     /// モード切替時に UI から呼ばれる。
     func modeChanged() {
-        let currentMode = mode
-        let manual = manualMode
         sessionQueue.async { [weak self] in
-            self?.reconcileInput(manual: manual, mode: currentMode)
+            self?.reconcileInput()
+        }
+    }
+
+    /// マクロ（超広角＋近距離AF）の ON/OFF。
+    func setMacroMode(_ on: Bool) {
+        macroMode = on
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.reconcileInput()
+            if on { self.setStatus("マクロ（超広角）: 被写体に近づけます") }
         }
     }
 
@@ -437,7 +473,6 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     // MARK: - マニュアル撮影（実カメラでのみ使う）
     func setManualMode(_ on: Bool) {
         manualMode = on
-        let currentMode = mode
         sessionQueue.async { [weak self] in
             guard let self else { return }
             if !on, let device = self.captureDevice {
@@ -456,7 +491,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                     device.unlockForConfiguration()
                 } catch { }
             }
-            self.reconcileInput(manual: on, mode: currentMode)
+            self.reconcileInput()
             if on {
                 self.applyManualSettings()
             }
@@ -553,9 +588,25 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     /// 倍率ボタンは ramp で滑らかに、ピンチ/スライダーは ramp なしで即時に反映する。
     func setZoom(_ factor: CGFloat, ramp: Bool = true) {
         sessionQueue.async { [weak self] in
-            guard let self, let device = self.captureDevice else { return }
+            guard let self else { return }
+            // 0.5倍は超広角カメラへの切替えで実現する（Logフレーム撮影時）
+            if factor < 0.99, self.mode == .logFrame,
+               self.captureDevice?.deviceType != .builtInUltraWideCamera,
+               self.ultraWideDevice != nil {
+                self.ultraWideActive = true
+                self.reconcileInput()
+                return
+            }
+            if factor >= 1, self.ultraWideActive,
+               self.captureDevice?.deviceType == .builtInUltraWideCamera {
+                self.ultraWideActive = false
+                self.reconcileInput()
+            }
+            guard let device = self.captureDevice else { return }
+            let scale = self.displayScale
+            let requested = factor / scale
             let upper = max(self.maxZoomFactor, device.minAvailableVideoZoomFactor)
-            let clamped = min(max(factor, device.minAvailableVideoZoomFactor), upper)
+            let clamped = min(max(requested, device.minAvailableVideoZoomFactor), upper)
             do {
                 try device.lockForConfiguration()
                 if ramp {
@@ -565,7 +616,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                     device.videoZoomFactor = clamped
                 }
                 device.unlockForConfiguration()
-                DispatchQueue.main.async { self.zoomFactor = clamped }
+                DispatchQueue.main.async { self.zoomFactor = clamped * scale }
                 // 静止画（RAW）側の倍率は写真コネクションのクロップ率が担うので両方に反映
                 self.applyStillZoom(clamped)
             } catch { }
