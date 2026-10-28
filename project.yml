@@ -12,11 +12,16 @@ targets:
       - ContentView.swift
       - CameraPreviewView.swift
       - LogPhotoCamera.swift
+      - LogPhotoLUT.swift
+      - Assets.xcassets
+    preBuildScripts:
+      - name: Decode App Icon
+        script: 'base64 -D -i "$SRCROOT/AppIcon.b64" -o "$SRCROOT/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png"'
     info:
       path: Info.plist
       properties:
-        CFBundleShortVersionString: "1.2"
-        CFBundleVersion: "3"
+        CFBundleShortVersionString: "1.3"
+        CFBundleVersion: "4"
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -27,5 +32,6 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.logphoto
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
-        MARKETING_VERSION: "1.2"
-        CURRENT_PROJECT_VERSION: "3"
+        MARKETING_VERSION: "1.3"
+        CURRENT_PROJECT_VERSION: "4"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

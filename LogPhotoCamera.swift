@@ -4,20 +4,27 @@ import ImageIO
 import Photos
 import UIKit
 
-/// Log Photo v1.2 - iPhone 16 Pro / Apple Log（第1世代）向け
+/// Log Photo v1.3 - iPhone 16 Pro / Apple Log（第1世代）向け
 ///
 /// 2つの撮影モード:
 /// - 方式A (.logFrame): Apple Log のビデオフレームをシャッター時に静止画保存（v0から継続）
 /// - 方式B (.rawLog): Bayer RAW で撮影し、(1) DNG をそのまま保存、
 ///   (2) RAW を現像して Log カーブ（近似）で変換した JPEG も保存する
 ///
-/// v1.1 では撮影時の露出補正（-2EV〜+2EV）を追加。
-/// v1.2 の変更:
-/// - ズーム対応: トリプルカメラ（仮想デバイス）を使い、0.5/1/2/5 の倍率ボタンと
-///   ピンチズームでレンズ切替＋ズームができるようにした。
-/// - 方式Aの保存を修正: v1.1 までは Core Image の色管理変換経由で sRGB 化していたため
-///   Log の見た目が通常写真に寄ってしまっていた。v1.2 ではフレームの画素値を
-///   変換せずそのまま JPEG 化し、Log エンコードを保持する。
+/// v1.1: 露出補正（-2EV〜+2EV）と三分割グリッドを追加。
+/// v1.2: ズーム対応（トリプルカメラ、0.5/1/2/5 ボタン＋ピンチ）。
+/// v1.3 の変更:
+/// - 露出スライダーを触ると落ちる問題の対策: UI 側の @State から onChange で
+///   反映する形に変え、カメラ側からの書き戻しをやめた。
+/// - 方式Aの保存を再対策: BGRA 以外のフレーム形式では従来の色管理あり変換に
+///   黙ってフォールバックして通常写真化していた。色管理なし（ワーキング
+///   カラースペース null）の CI レンダリングに統一し、保存時のステータスに
+///   フレーム形式（fmt）を表示して切り分けできるようにした。
+/// - ズームスライダーを追加（仮想デバイスがレンズ切替を自動で行う）。
+/// - 保存形式に TIFF を追加（方式Bは 16bit TIFF）。
+/// - マニュアル撮影（SS / ISO / フォーカス / WB）を追加。
+/// - LUT 対応: 内蔵LUT（近似変換・モノクロ）と .cube ファイルの読み込み。
+///   選択した LUT は保存時に適用する。
 /// 方式Bの Log 変換は Apple Log の厳密な OETF ではなく近似カーブ。
 final class LogPhotoCamera: NSObject, ObservableObject {
 
@@ -27,20 +34,50 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         var id: String { rawValue }
     }
 
+    enum OutputFormat: String, CaseIterable, Identifiable {
+        case jpeg = "JPEG"
+        case tiff = "TIFF"
+        var id: String { rawValue }
+    }
+
     @Published var appleLogAvailable = false
     @Published var rawAvailable = false
     @Published var statusText = "準備中…"
     @Published var mode: CaptureMode = .logFrame
-    @Published var exposureCompensation: Double = 0
     @Published var zoomFactor: CGFloat = 1.0
     @Published var zoomPresets: [CGFloat] = [1.0]
+    @Published var zoomRange: ClosedRange<CGFloat> = 1.0...1.0
     private var maxZoomFactor: CGFloat = 1.0
+
+    // v1.3: 保存形式と LUT
+    @Published var outputFormat: OutputFormat = .jpeg
+    @Published var lutNames: [String] = ["なし"]
+    @Published var selectedLUTName: String = "なし"
+    private let lutStore = LUTStore()
+    private var lutEntries: [String: LUTStore.Entry] = [:]
+
+    // v1.3: マニュアル撮影
+    @Published var manualMode = false
+    @Published var shutterSeconds: Double = 1.0 / 60
+    @Published var isoValue: Double = 100
+    @Published var focusPosition: Double = 0.5
+    @Published var whiteBalanceKelvin: Double = 5200
+    @Published var isoRange: ClosedRange<Double> = 50...1600
+    @Published var shutterRange: ClosedRange<Double> = (1.0 / 8000)...1.0
+
+    override init() {
+        super.init()
+        refreshLUTList()
+    }
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "logphoto.session")
     private let videoOutput = AVCaptureVideoDataOutput()
     private let photoOutput = AVCapturePhotoOutput()
     private let ciContext = CIContext()
+    /// 色管理変換をしないレンダリング用（Log の画素値をそのまま書き出すため）
+    private let rawContext = CIContext(options: [.workingColorSpace: NSNull(),
+                                                  .outputColorSpace: NSNull()])
     private var captureDevice: AVCaptureDevice?
 
     private let bufferLock = NSLock()
@@ -141,10 +178,23 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 $0 >= device.minAvailableVideoZoomFactor - 0.001 && $0 <= maxZoom
             }
             let initialZoom = device.videoZoomFactor
+            // マニュアル撮影の可動範囲
+            let rangeFormat = logFormat ?? device.activeFormat
+            let isoLo = Double(rangeFormat.minISO)
+            let isoHi = Double(rangeFormat.maxISO)
+            let ssLo = rangeFormat.minExposureDuration.seconds
+            let ssHi = min(rangeFormat.maxExposureDuration.seconds, 2.0)
+            let currentISO = Double(device.iso)
+            let currentSS = device.exposureDuration.seconds
             DispatchQueue.main.async {
                 self.maxZoomFactor = maxZoom
                 self.zoomPresets = presets.isEmpty ? [1.0] : presets
                 self.zoomFactor = initialZoom
+                self.zoomRange = device.minAvailableVideoZoomFactor...maxZoom
+                if isoHi > isoLo { self.isoRange = isoLo...isoHi }
+                if ssHi > ssLo { self.shutterRange = ssLo...ssHi }
+                self.isoValue = min(max(currentISO, isoLo), isoHi)
+                self.shutterSeconds = min(max(currentSS, ssLo), ssHi)
             }
             device.unlockForConfiguration()
         } catch {
@@ -152,17 +202,122 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - LUT
+    func refreshLUTList() {
+        lutStore.reload()
+        var entries: [String: LUTStore.Entry] = [:]
+        let log709 = LUTStore.builtinLogTo709()
+        let mono = LUTStore.builtinMono()
+        entries[log709.name] = log709
+        entries[mono.name] = mono
+        for entry in lutStore.userLUTs { entries[entry.name] = entry }
+        lutEntries = entries
+        lutNames = ["なし", log709.name, mono.name] + lutStore.userLUTs.map { $0.name }
+        let stored = UserDefaults.standard.string(forKey: "logphoto.selectedLUT")
+        selectedLUTName = (stored != nil && entries[stored!] != nil) ? stored! : "なし"
+    }
+
+    func selectLUT(_ name: String) {
+        selectedLUTName = name
+        UserDefaults.standard.set(name, forKey: "logphoto.selectedLUT")
+    }
+
+    func importLUT(from url: URL) {
+        if let entry = lutStore.importLUT(from: url) {
+            refreshLUTList()
+            selectLUT(entry.name)
+            setStatus("LUT「\(entry.name)」を追加しました")
+        } else {
+            setStatus("その .cube は読み込めませんでした")
+        }
+    }
+
+    private var activeLUT: LUTStore.Entry? { lutEntries[selectedLUTName] }
+
+    private func applyLUT(to image: CIImage) -> CIImage {
+        guard let lut = activeLUT,
+              let filter = CIFilter(name: "CIColorCube",
+                                    parameters: ["inputCubeDimension": lut.dimension,
+                                                 "inputCubeData": lut.data,
+                                                 kCIInputImageKey: image]),
+              let out = filter.outputImage else { return image }
+        return out
+    }
+
     // MARK: - 露出補正
-    /// カメラの露出ターゲットをずらす。Log撮影時の露出決めに使う想定。
+    /// カメラの露出ターゲットをずらす。UI の @State から onChange 経由で呼ばれる。
+    /// カメラ側から UI へ値を書き戻さない（v1.2 までの書き戻しがクラッシュの
+    /// 原因候補だったため）。
     func applyExposureCompensation(_ ev: Double) {
         sessionQueue.async { [weak self] in
             guard let self, let device = self.captureDevice else { return }
             let clamped = max(Double(device.minExposureTargetBias),
                               min(Double(device.maxExposureTargetBias), ev))
             device.setExposureTargetBias(Float(clamped), completionHandler: nil)
-            if abs(self.exposureCompensation - clamped) > 0.001 {
-                DispatchQueue.main.async { self.exposureCompensation = clamped }
-            }
+        }
+    }
+
+    // MARK: - マニュアル撮影
+    func setManualMode(_ on: Bool) {
+        manualMode = on
+        if on {
+            updateManualExposure()
+            updateManualFocus()
+            updateManualWhiteBalance()
+            return
+        }
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else { return }
+            do {
+                try device.lockForConfiguration()
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
+                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                    device.whiteBalanceMode = .continuousAutoWhiteBalance
+                }
+                device.unlockForConfiguration()
+            } catch { }
+        }
+    }
+
+    func updateManualExposure() {
+        guard manualMode else { return }
+        let seconds = shutterSeconds
+        let iso = Float(isoValue)
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else { return }
+            device.setExposureModeCustom(
+                duration: CMTimeMakeWithSeconds(seconds, preferredTimescale: 1_000_000_000),
+                iso: iso, completionHandler: nil)
+        }
+    }
+
+    func updateManualFocus() {
+        guard manualMode else { return }
+        let position = Float(focusPosition)
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else { return }
+            device.setFocusModeLocked(lensPosition: position, completionHandler: nil)
+        }
+    }
+
+    func updateManualWhiteBalance() {
+        guard manualMode else { return }
+        let kelvin = Float(whiteBalanceKelvin)
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else { return }
+            let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
+                temperature: kelvin, tint: 0)
+            var gains = device.deviceWhiteBalanceGains(for: values)
+            let maxGain = device.maxWhiteBalanceGain
+            gains.redGain = min(max(gains.redGain, 1), maxGain)
+            gains.greenGain = min(max(gains.greenGain, 1), maxGain)
+            gains.blueGain = min(max(gains.blueGain, 1), maxGain)
+            device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
         }
     }
 
@@ -204,25 +359,43 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         bufferLock.unlock()
         guard let buffer else { setStatus("フレーム取得前です。少し待ってください"); return }
 
-        // Log エンコードされた画素値を色管理変換で化けさせないよう、
-        // バッファをそのまま JPEG 化する（プロファイルは sRGB を付ける）。
-        if let data = jpegDataFromPixelBuffer(buffer) {
-            savePhotoData(data, completion: "Log写真を保存しました")
+        let formatCode = fourCharCode(CVPixelBufferGetPixelFormatType(buffer))
+        let isTIFF = outputFormat == .tiff
+
+        // LUT なし & BGRA: 画素値をそのまま書き出す（最速・無変換）
+        if activeLUT == nil, let data = imageDataFromPixelBuffer(buffer, isTIFF: isTIFF) {
+            savePhotoData(data, completion: isTIFF
+                ? "Log写真（TIFF）を保存しました（fmt \(formatCode)）"
+                : "Log写真を保存しました（fmt \(formatCode)）")
             return
         }
-        // フォールバック: 従来の Core Image 経路
-        let ciImage = CIImage(cvPixelBuffer: buffer)
+        // それ以外（LUT適用 / TIFF / 非BGRA形式）は色管理なしの CI レンダリング。
+        // ワーキングカラースペース null なので Log の画素値は変換されない。
+        var image = CIImage(cvPixelBuffer: buffer)
+        image = applyLUT(to: image)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-        guard let data = ciContext.jpegRepresentation(of: ciImage,
-                                                      colorSpace: colorSpace) else {
-            setStatus("画像の変換に失敗しました")
+        let data = isTIFF
+            ? rawContext.tiffRepresentation(of: image, format: .RGBA8, colorSpace: colorSpace)
+            : rawContext.jpegRepresentation(of: image, colorSpace: colorSpace)
+        guard let data else {
+            setStatus("画像の変換に失敗しました（fmt \(formatCode)）")
             return
         }
-        savePhotoData(data, completion: "Log写真を保存しました")
+        savePhotoData(data, completion: isTIFF
+            ? "Log写真（TIFF）を保存しました（fmt \(formatCode)）"
+            : "Log写真を保存しました（fmt \(formatCode)）")
     }
 
-    /// BGRA ピクセルバッファの画素値を変換せずに JPEG データ化する。
-    private func jpegDataFromPixelBuffer(_ pixelBuffer: CVPixelBuffer) -> Data? {
+    private func fourCharCode(_ code: OSType) -> String {
+        let bytes: [UInt8] = [UInt8((code >> 24) & 0xff), UInt8((code >> 16) & 0xff),
+                              UInt8((code >> 8) & 0xff), UInt8(code & 0xff)]
+        let text = String(bytes: bytes, encoding: .ascii) ?? "\(code)"
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? "\(code)" : trimmed
+    }
+
+    /// BGRA ピクセルバッファの画素値を変換せずに JPEG / TIFF データ化する。
+    private func imageDataFromPixelBuffer(_ pixelBuffer: CVPixelBuffer, isTIFF: Bool) -> Data? {
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
             return nil
         }
@@ -247,10 +420,15 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                                     decode: nil, shouldInterpolate: false,
                                     intent: .defaultIntent) else { return nil }
         let out = NSMutableData()
+        let type = (isTIFF ? "public.tiff" : "public.jpeg") as CFString
         guard let destination = CGImageDestinationCreateWithData(
-            out, "public.jpeg" as CFString, 1, nil) else { return nil }
-        CGImageDestinationAddImage(destination, cgImage,
-            [kCGImageDestinationLossyCompressionQuality: 0.95] as CFDictionary)
+            out, type, 1, nil) else { return nil }
+        if isTIFF {
+            CGImageDestinationAddImage(destination, cgImage, nil)
+        } else {
+            CGImageDestinationAddImage(destination, cgImage,
+                [kCGImageDestinationLossyCompressionQuality: 0.95] as CFDictionary)
+        }
         guard CGImageDestinationFinalize(destination) else { return nil }
         return out as Data
     }
@@ -270,8 +448,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         setStatus("RAW撮影中…")
     }
 
-    /// RAW(DNG) から Log変換JPEG を作る。失敗時は nil。
-    private func makeLogJPEG(fromDNG data: Data) -> Data? {
+    /// RAW(DNG) から Log変換画像（JPEG / TIFF）を作る。LUT 選択時は適用する。失敗時は nil。
+    private func makeLogImageData(fromDNG data: Data) -> Data? {
         guard let rawFilter = CIRAWFilter(imageData: data, identifierHint: "dng"),
               var image = rawFilter.outputImage else { return nil }
 
@@ -302,8 +480,16 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             image = out // カーネルが使えない環境ではフラット化で代替
         }
 
+        image = applyLUT(to: image)
+
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-        return ciContext.jpegRepresentation(of: image, colorSpace: colorSpace)
+        switch outputFormat {
+        case .jpeg:
+            return ciContext.jpegRepresentation(of: image, colorSpace: colorSpace)
+        case .tiff:
+            return ciContext.tiffRepresentation(of: image, format: .RGBA16,
+                                                colorSpace: colorSpace)
+        }
     }
 
     // MARK: - 保存ヘルパー
@@ -358,8 +544,10 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
             savePhotoData(data,
                           uniformTypeIdentifier: "com.adobe.raw-image",
                           completion: "DNG（RAW）を保存しました")
-            if let jpeg = makeLogJPEG(fromDNG: data) {
-                savePhotoData(jpeg, completion: "Log変換JPEGも保存しました")
+            if let converted = makeLogImageData(fromDNG: data) {
+                savePhotoData(converted, completion: outputFormat == .tiff
+                    ? "Log変換TIFFも保存しました"
+                    : "Log変換JPEGも保存しました")
             }
         } else {
             savePhotoData(data, completion: "写真を保存しました")
