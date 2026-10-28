@@ -131,6 +131,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private var teleTooClose = false              // 望遠の最短距離より近い → 広角のクロップへ逃がす
     private var teleRetryAt: Date = .distantPast  // 望遠へ戻す再試行の時刻（往復防止）
     private var focusObservation: NSKeyValueObservation?
+    private var teleRetryCount = 0                // 近距離クロップからの望遠復帰の試行回数
+    private var previewCropFactor: CGFloat = 1    // RAW モードのプレビュー用クロップ倍率（デバイス倍率は 1.0 のまま）
+    private var ignoreFramesUntil: CFTimeInterval = 0 // レンズ切替直後のフレームを捨てる期限
     private var lensScales: [String: CGFloat] = [:] // uniqueID → 表示倍率（広角 = 1）
     private var captureDevice: AVCaptureDevice?   // 現在の入力デバイス
     private var configuredMode: CaptureMode?      // 現在のフォーマットが対応しているモード
@@ -487,10 +490,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     /// 広角クロップへ逃げている間にシーンが変わったら、望遠へ戻せるか試す。
     private func retryTelephotoIfNeeded() {
-        guard teleTooClose, Date() >= teleRetryAt,
+        guard teleTooClose, Date() >= teleRetryAt, teleRetryCount < 2,
               let tele = teleDevice, desiredZoom >= zoomScale(for: tele) else { return }
         teleTooClose = false
-        teleRetryAt = Date().addingTimeInterval(3)
+        teleRetryCount += 1
+        teleRetryAt = Date().addingTimeInterval(4)
         reconcileInput()
     }
 
@@ -511,9 +515,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             }
             if deviceChanged, let newInput = try? AVCaptureDeviceInput(device: target) {
                 for input in session.inputs { session.removeInput(input) }
-                hasLog = configureFormat(target) // 入力に加える前に設定しておく
                 if session.canAddInput(newInput) { session.addInput(newInput) }
+                // 入力に加えた後・commit の前にフォーマットと色空間を決める（同じトランザクション内）
+                hasLog = configureFormat(target)
                 captureDevice = target
+                ignoreFramesUntil = CACurrentMediaTime() + 0.25
             } else {
                 hasLog = configureFormat(target)
             }
@@ -610,7 +616,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let buffer = latestBuffer
         bufferLock.unlock()
         guard let buffer else { return nil }
-        return applyLUT(to: CIImage(cvPixelBuffer: buffer))
+        var image = CIImage(cvPixelBuffer: buffer)
+        // RAW モードはデバイスのズームを使えない（RAW 撮影の要件）ので、プレビューを切り出して倍率を見せる
+        let crop = previewCropFactor
+        if crop > 1.01 { image = centerCrop(image, factor: crop) }
+        return applyLUT(to: image)
     }
 
     // MARK: - LUT
@@ -830,7 +840,10 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         zoomRequestLock.unlock()
         guard let request else { return }
         desiredZoom = min(max(request.factor, zoomLower), zoomUpper)
-        if let tele = teleDevice, desiredZoom < zoomScale(for: tele) { teleTooClose = false }
+        if let tele = teleDevice, desiredZoom < zoomScale(for: tele) {
+            teleTooClose = false
+            teleRetryCount = 0
+        }
         if desiredDevice() != captureDevice {
             zoomSwitchToken += 1
             if request.switchLensNow {
@@ -855,13 +868,17 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let requested = desiredZoom / scale
         let deviceMax = min(device.activeFormat.videoMaxZoomFactor, 15.0)
         let clamped = min(max(requested, device.minAvailableVideoZoomFactor), deviceMax)
+        // RAW 撮影はデバイスの videoZoomFactor が 1.0 でないと例外になる（AVFoundation の規則）。
+        // RAW モードではデバイス側は常に 1.0 にし、倍率はプレビューのクロップで表現する。
+        let deviceZoom: CGFloat = mode == .rawLog ? 1.0 : clamped
+        previewCropFactor = mode == .rawLog ? clamped : 1.0
         do {
             try device.lockForConfiguration()
-            if ramp {
-                device.ramp(toVideoZoomFactor: clamped, withRate: 12)
+            if ramp, mode != .rawLog {
+                device.ramp(toVideoZoomFactor: deviceZoom, withRate: 12)
             } else {
                 device.cancelVideoZoomRamp()
-                device.videoZoomFactor = clamped
+                if device.videoZoomFactor != deviceZoom { device.videoZoomFactor = deviceZoom }
             }
             device.unlockForConfiguration()
         } catch { return }
@@ -923,6 +940,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             let center = CGPoint(x: 0.5, y: 0.5)
             if device.isAutoFocusRangeRestrictionSupported {
                 device.autoFocusRangeRestriction = .none
+            }
+            // 静止画向け: なめらかAF（動画用の遅いAF）は切り、顔優先AFは使う
+            if device.isSmoothAutoFocusSupported { device.isSmoothAutoFocusEnabled = false }
+            if device.isFaceDrivenAutoFocusEnabled == false {
+                device.automaticallyAdjustsFaceDrivenAutoFocusEnabled = true
             }
             if device.isFocusPointOfInterestSupported { device.focusPointOfInterest = center }
             if device.isFocusModeSupported(.continuousAutoFocus) {
@@ -1102,14 +1124,25 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 self.reconcileInput()
                 return
             }
-            self.pendingRawZoom = self.captureDevice?.videoZoomFactor ?? 1
+            // RAW の要件: デバイス倍率 1.0（念のためここでも保証）。切り出し倍率は別に覚える。
+            if let device = self.captureDevice, device.videoZoomFactor != 1.0,
+               (try? device.lockForConfiguration()) != nil {
+                device.cancelVideoZoomRamp()
+                device.videoZoomFactor = 1.0
+                device.unlockForConfiguration()
+            }
+            if let connection = self.photoOutput.connection(with: .video),
+               connection.videoScaleAndCropFactor != 1.0 {
+                connection.videoScaleAndCropFactor = 1.0
+            }
+            self.pendingRawZoom = self.previewCropFactor
             let dims = self.photoOutput.maxPhotoDimensions
             let fmt = self.fourCharCode(rawType)
             self.markRawStage("1 設定作成（\(fmt) \(dims.width)x\(dims.height) preset=\(self.rawUsesPhotoPreset ? "photo" : "input")）")
             let settings = AVCapturePhotoSettings(rawPixelFormatType: rawType)
-            // 注意: RAW 用の設定で photoQualityPrioritization を設定すると
-            // -[AVCapturePhotoSettings setPhotoQualityPrioritization:] が例外を投げて落ちる
-            // （build 16 のクラッシュログで確認）。RAW では既定のままにする。
+            // AVFoundation の規則: Bayer RAW では photoQualityPrioritization は .speed 必須
+            // （.balanced/.quality は設定時に例外、既定の .balanced のままでも capturePhoto で例外）。
+            settings.photoQualityPrioritization = .speed
             // 可能な機種では無音化（日本向け端末では非対応のことが多い）
             if !self.shutterSoundEnabled, self.photoOutput.isShutterSoundSuppressionSupported {
                 settings.isShutterSoundSuppressionEnabled = true
@@ -1216,6 +1249,8 @@ extension LogPhotoCamera: AVCaptureVideoDataOutputSampleBufferDelegate {
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        // レンズ切替直後の数フレームは色空間が整う前のことがあるので捨てる（前のフレームを保持）
+        if CACurrentMediaTime() < ignoreFramesUntil { return }
         bufferLock.lock()
         latestBuffer = buffer
         bufferLock.unlock()
