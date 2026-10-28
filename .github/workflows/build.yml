@@ -3,6 +3,8 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: macos-15
@@ -31,3 +33,17 @@ jobs:
         with:
           name: LogPhoto-ipa
           path: LogPhoto.ipa
+      # サイドロード用: ビルドごとに GitHub Release へも IPA を置く。
+      # 最新版は常に https://github.com/mekaru098/LogPhoto/releases/latest/download/LogPhoto.ipa
+      - name: Publish IPA to GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(sed -n 's/.*MARKETING_VERSION: "\(.*\)"/\1/p' project.yml | head -1)
+          TAG="v${VERSION}-build${{ github.run_number }}"
+          cp LogPhoto.ipa "LogPhoto-${TAG}.ipa"
+          gh release create "$TAG" LogPhoto.ipa "LogPhoto-${TAG}.ipa" \
+            --title "LogPhoto ${TAG}" \
+            --notes "Unsigned IPA for sideloading. Commit ${{ github.sha }}" \
+            --latest
