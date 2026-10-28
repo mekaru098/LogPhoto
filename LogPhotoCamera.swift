@@ -4,7 +4,14 @@ import ImageIO
 import Photos
 import UIKit
 
-/// Log Photo v1.6 - iPhone 16 Pro / Apple Log（第1世代）向け
+/// Log Photo v1.7 - iPhone 16 Pro / Apple Log（第1世代）向け
+///
+/// v1.7 の変更:
+/// - RAW が有効にならない問題への段階対策: RAW用フォーマットへ切り替えた後、
+///   対応形式の読み取りを少し待って再確認し（パイプライン再構成との競合対策）、
+///   それでもダメなら RAW モード中はセッションを写真優先プリセット（.photo）に
+///   切り替える（RAW が確実に使える構成）。Logフレームへ戻ると復帰する。
+/// - 画角 4:3 を追加（プレビューのマスク表示と、方式Aの保存時センタートリミング）。
 ///
 /// v1.6 の変更:
 /// - RAW+Log でちらつく問題を修正。フォーマット探索のループをやめ、
@@ -56,8 +63,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private var maxZoomFactor: CGFloat = 1.0
     @Published var lastThumbnail: UIImage?
 
-    // 保存形式と LUT
+    // 保存形式・画角・LUT
     @Published var outputFormat: OutputFormat = .jpeg
+    @Published var aspectFourThree: Bool = UserDefaults.standard.bool(forKey: "logphoto.aspect43")
     @Published var lutNames: [String] = ["なし"]
     @Published var selectedLUTName: String = "なし"
     private let lutStore = LUTStore()
@@ -91,6 +99,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private var virtualDevice: AVCaptureDevice?  // トリプル/デュアル（ズーム用）
     private var physicalDevice: AVCaptureDevice? // 広角の実カメラ（マニュアル/RAW用）
     private var captureDevice: AVCaptureDevice?  // 現在の入力デバイス
+    private var rawSetupInFlight = false
+    private var rawUsesPhotoPreset = false
 
     private let bufferLock = NSLock()
     private var latestBuffer: CVPixelBuffer?
@@ -221,25 +231,29 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     }
 
     /// マニュアル / RAW が必要なときは実カメラ、それ以外は仮想デバイスへ。
-    /// RAW 用フォーマット探索は RAW+Log モードのときだけ行う
-    /// （マニュアルでも走らせるとフォーマット切替が多発してプレビューがちらつく）。
     private func reconcileInput(manual: Bool, mode: CaptureMode) {
+        // RAW 用に写真優先プリセットへ寄せていたら先に戻す
+        if mode != .rawLog, rawUsesPhotoPreset {
+            session.beginConfiguration()
+            session.sessionPreset = .inputPriority
+            session.commitConfiguration()
+            rawUsesPhotoPreset = false
+        }
         let wantsPhysical = manual || mode == .rawLog
         let target = wantsPhysical ? (physicalDevice ?? virtualDevice)
                                    : (virtualDevice ?? physicalDevice)
-        guard let target, target != captureDevice else {
-            if mode == .rawLog { ensureRawCapableFormat() }
-            return
+        guard let target else { return }
+        if target != captureDevice {
+            guard let newInput = try? AVCaptureDeviceInput(device: target) else { return }
+            session.beginConfiguration()
+            for input in session.inputs { session.removeInput(input) }
+            if session.canAddInput(newInput) { session.addInput(newInput) }
+            session.commitConfiguration()
+            captureDevice = target
+            applyVideoRotation()
+            applyDeviceConfiguration(target)
         }
-        guard let newInput = try? AVCaptureDeviceInput(device: target) else { return }
-        session.beginConfiguration()
-        for input in session.inputs { session.removeInput(input) }
-        if session.canAddInput(newInput) { session.addInput(newInput) }
-        session.commitConfiguration()
-        captureDevice = target
-        applyVideoRotation()
-        applyDeviceConfiguration(target)
-        if mode == .rawLog { ensureRawCapableFormat() }
+        if mode == .rawLog { beginRawSetup() }
     }
 
     private func photoArea(_ format: AVCaptureDevice.Format) -> Int {
@@ -247,38 +261,72 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             .map { Int($0.width) * Int($0.height) }.max() ?? 0
     }
 
-    /// 実カメラを RAW 撮影用のフォーマットに切り替える（sessionQueue 上で呼ぶ）。
-    /// ループ探索はしない: 写真の最大解像度が最大のフォーマットへ1回だけ切り替え、
-    /// 色空間は Log 以外を選ぶ（Log 色空間のままだと RAW が有効にならない疑い）。
-    /// それでも RAW が有効にならなければ Log フォーマットへ復帰する。
-    private func ensureRawCapableFormat() {
-        guard let device = captureDevice else { return }
+    /// RAW セットアップ（sessionQueue 上で呼ぶ）。段階的に構成を変えて試す:
+    /// 1) RAW用フォーマット（写真解像度最大・Log以外の色空間）へ切替えて少し待つ
+    /// 2) それでも有効にならなければ写真優先プリセット（.photo）へ切り替える
+    private func beginRawSetup() {
+        guard !rawSetupInFlight else { return }
         if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
             DispatchQueue.main.async { self.rawAvailable = true }
             return
         }
-        guard let format = device.formats.max(by: { photoArea($0) < photoArea($1) }),
-              !format.supportedMaxPhotoDimensions.isEmpty else {
-            DispatchQueue.main.async { self.rawAvailable = false }
-            setStatus("RAW 対応フォーマットが見つかりません")
+        guard let device = captureDevice else { return }
+        rawSetupInFlight = true
+        if let format = device.formats.max(by: { photoArea($0) < photoArea($1) }),
+           !format.supportedMaxPhotoDimensions.isEmpty {
+            do {
+                try device.lockForConfiguration()
+                device.activeFormat = format
+                let nonLog = format.supportedColorSpaces.first { $0 != .appleLog }
+                    ?? format.supportedColorSpaces.first
+                if let nonLog { device.activeColorSpace = nonLog }
+                device.unlockForConfiguration()
+            } catch { }
+        }
+        pollRawTypes(attempt: 0, photoPresetStage: false)
+    }
+
+    private func pollRawTypes(attempt: Int, photoPresetStage: Bool) {
+        guard mode == .rawLog else {
+            rawSetupInFlight = false
             return
         }
-        do {
-            try device.lockForConfiguration()
-            device.activeFormat = format
-            let nonLog = format.supportedColorSpaces.first { $0 != .appleLog }
-                ?? format.supportedColorSpaces.first
-            if let nonLog { device.activeColorSpace = nonLog }
-            device.unlockForConfiguration()
-        } catch { }
-        if photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
-            applyDeviceConfiguration(device)
-            DispatchQueue.main.async { self.rawAvailable = false }
-            setStatus("この構成では RAW が使えませんでした")
-        } else {
+        if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
+            rawSetupInFlight = false
             DispatchQueue.main.async { self.rawAvailable = true }
             setStatus("RAW+Log の準備ができました")
+            return
         }
+        if attempt < 4 {
+            sessionQueue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.pollRawTypes(attempt: attempt + 1, photoPresetStage: photoPresetStage)
+            }
+            return
+        }
+        if !photoPresetStage {
+            // 段階2: 写真優先プリセットで再構成する
+            session.beginConfiguration()
+            session.sessionPreset = .photo
+            session.commitConfiguration()
+            rawUsesPhotoPreset = true
+            applyVideoRotation()
+            pollRawTypes(attempt: 0, photoPresetStage: true)
+            return
+        }
+        finishRawSetupFailure()
+    }
+
+    private func finishRawSetupFailure() {
+        rawSetupInFlight = false
+        if rawUsesPhotoPreset {
+            session.beginConfiguration()
+            session.sessionPreset = .inputPriority
+            session.commitConfiguration()
+            rawUsesPhotoPreset = false
+        }
+        if let device = captureDevice { applyDeviceConfiguration(device) }
+        DispatchQueue.main.async { self.rawAvailable = false }
+        setStatus("この構成では RAW が使えませんでした")
     }
 
     /// モード切替時に UI から呼ばれる。
@@ -523,16 +571,18 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let formatCode = fourCharCode(CVPixelBufferGetPixelFormatType(buffer))
         let isTIFF = outputFormat == .tiff
 
-        // LUT なし & BGRA: 画素値をそのまま書き出す（最速・無変換）
-        if activeLUT == nil, let data = imageDataFromPixelBuffer(buffer, isTIFF: isTIFF) {
+        // LUT なし & BGRA & フル画角: 画素値をそのまま書き出す（最速・無変換）
+        if activeLUT == nil, !aspectFourThree,
+           let data = imageDataFromPixelBuffer(buffer, isTIFF: isTIFF) {
             updateThumbnail(from: data)
             savePhotoData(data, completion: isTIFF
                 ? "Log写真（TIFF）を保存しました（fmt \(formatCode)）"
                 : "Log写真を保存しました（fmt \(formatCode)）")
             return
         }
-        // それ以外（LUT適用 / TIFF / 非BGRA形式）は色管理なしの CI レンダリング。
+        // それ以外（LUT適用 / TIFF / 非BGRA形式 / 4:3）は色管理なしの CI レンダリング。
         var image = CIImage(cvPixelBuffer: buffer)
+        if aspectFourThree { image = cropToFourThree(image) }
         image = applyLUT(to: image)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         let data = isTIFF
@@ -546,6 +596,29 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         savePhotoData(data, completion: isTIFF
             ? "Log写真（TIFF）を保存しました（fmt \(formatCode)）"
             : "Log写真を保存しました（fmt \(formatCode)）")
+    }
+
+    /// 画角 4:3（縦向き 3:4）へのセンタートリミング。
+    private func cropToFourThree(_ image: CIImage) -> CIImage {
+        let extent = image.extent
+        guard extent.width > 0, extent.height > 0 else { return image }
+        let target = 3.0 / 4.0 // width / height（縦向き）
+        var rect = extent
+        if extent.width / extent.height > target {
+            let w = extent.height * target
+            rect = CGRect(x: extent.minX + (extent.width - w) / 2, y: extent.minY,
+                          width: w, height: extent.height)
+        } else {
+            let h = extent.width / target
+            rect = CGRect(x: extent.minX, y: extent.minY + (extent.height - h) / 2,
+                          width: extent.width, height: h)
+        }
+        return image.cropped(to: rect)
+    }
+
+    func setAspectFourThree(_ on: Bool) {
+        aspectFourThree = on
+        UserDefaults.standard.set(on, forKey: "logphoto.aspect43")
     }
 
     private func fourCharCode(_ code: OSType) -> String {

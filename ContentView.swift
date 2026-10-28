@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var flash = false
     @State private var showGrid = true
     @State private var showBadges = true
+    @State private var showPanel = true
     @State private var pinchStartZoom: CGFloat? = nil
     // 露出は UI 側 @State で持ち、onChange でカメラへ反映する
     @State private var exposureEV: Double = 0
@@ -38,6 +39,21 @@ struct ContentView: View {
             if showGrid {
                 RuleOfThirdsGrid()
                     .ignoresSafeArea()
+            }
+
+            // 4:3 画角のマスク（上下を暗くして撮影範囲を示す）
+            if camera.aspectFourThree {
+                GeometryReader { geo in
+                    let visibleHeight = min(geo.size.width * 4 / 3, geo.size.height)
+                    let barHeight = max((geo.size.height - visibleHeight) / 2, 0)
+                    VStack(spacing: 0) {
+                        Color.black.opacity(0.55).frame(height: barHeight)
+                        Spacer()
+                        Color.black.opacity(0.55).frame(height: barHeight)
+                    }
+                }
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
             }
 
             if flash {
@@ -88,8 +104,9 @@ struct ContentView: View {
                 }
 
                 // コントロールパネル
+                if showPanel {
                 VStack(spacing: 12) {
-                    // マニュアル・形式・LUT
+                    // マニュアル・形式・LUT・画角
                     HStack(spacing: 10) {
                         Button {
                             camera.setManualMode(!camera.manualMode)
@@ -112,7 +129,17 @@ struct ContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .colorScheme(.dark)
-                        .frame(width: 118)
+                        .frame(width: 108)
+
+                        Button {
+                            camera.setAspectFourThree(!camera.aspectFourThree)
+                        } label: {
+                            Text(camera.aspectFourThree ? "4:3" : "フル")
+                                .font(.caption.bold())
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 9).padding(.vertical, 7)
+                                .background(Color.white.opacity(0.14), in: Capsule())
+                        }
 
                         Picker("LUT", selection: lutSelection) {
                             ForEach(camera.lutNames, id: \.self) { name in
@@ -208,8 +235,21 @@ struct ContentView: View {
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
                 .overlay(RoundedRectangle(cornerRadius: 24)
                     .stroke(.white.opacity(0.10), lineWidth: 1))
+                .overlay(alignment: .topTrailing) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { showPanel = false }
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 24, height: 24)
+                            .background(.black.opacity(0.35), in: Circle())
+                    }
+                    .offset(x: 8, y: -10)
+                }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 12)
+                }
 
                 // 下部: サムネイル / シャッター
                 HStack {
@@ -248,7 +288,23 @@ struct ContentView: View {
 
                     Spacer()
 
-                    Color.clear.frame(width: 46, height: 46)
+                    if showPanel {
+                        Color.clear.frame(width: 46, height: 46)
+                    } else {
+                        // パネルを閉じているときは、ここから開き直せる
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) { showPanel = true }
+                        } label: {
+                            Image(systemName: "slider.horizontal.3")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .frame(width: 46, height: 46)
+                                .background(.black.opacity(0.4))
+                                .clipShape(RoundedRectangle(cornerRadius: 11))
+                                .overlay(RoundedRectangle(cornerRadius: 11)
+                                    .stroke(.white.opacity(0.45), lineWidth: 1))
+                        }
+                    }
                 }
                 .padding(.horizontal, 22)
                 .padding(.bottom, 24)
