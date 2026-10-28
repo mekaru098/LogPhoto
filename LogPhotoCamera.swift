@@ -74,6 +74,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     @Published var aspectFourThree: Bool = UserDefaults.standard.bool(forKey: "logphoto.aspect43")
     @Published var lutNames: [String] = ["なし"]
     @Published var selectedLUTName: String = "なし"
+    /// LUT を保存画像にも焼き込むか（false = プレビューだけに当てる。保存は Log のまま）
+    @Published var bakeLUTIntoFiles: Bool = UserDefaults.standard.bool(forKey: "logphoto.bakeLUT")
     private let lutStore = LUTStore()
     private var lutEntries: [String: LUTStore.Entry] = [:]
     private let lutLock = NSLock()
@@ -668,8 +670,20 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         return activeLUTSnapshot
     }
 
+    /// 保存時に使う LUT（焼き込みが OFF なら nil）
+    private var savedLUT: LUTStore.Entry? { bakeLUTIntoFiles ? activeLUT : nil }
+
+    func setBakeLUT(_ on: Bool) {
+        bakeLUTIntoFiles = on
+        UserDefaults.standard.set(on, forKey: "logphoto.bakeLUT")
+    }
+
     private func applyLUT(to image: CIImage) -> CIImage {
-        guard let lut = activeLUT,
+        applyLUT(to: image, entry: activeLUT)
+    }
+
+    private func applyLUT(to image: CIImage, entry: LUTStore.Entry?) -> CIImage {
+        guard let lut = entry,
               let filter = CIFilter(name: "CIColorCube",
                                     parameters: ["inputCubeDimension": lut.dimension,
                                                  "inputCubeData": lut.data,
@@ -1001,7 +1015,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let isTIFF = outputFormat == .tiff
 
         // LUT なし & BGRA & フル画角: 画素値をそのまま書き出す（最速・無変換）
-        if activeLUT == nil, !aspectFourThree,
+        if savedLUT == nil, !aspectFourThree,
            let data = imageDataFromPixelBuffer(buffer, isTIFF: isTIFF) {
             updateThumbnail(from: data)
             savePhotoData(data, completion: logSaveMessage(isTIFF: isTIFF, formatCode: formatCode))
@@ -1010,7 +1024,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         // それ以外（LUT適用 / TIFF / 非BGRA形式 / 4:3）は色管理なしの CI レンダリング。
         var image = CIImage(cvPixelBuffer: buffer)
         if aspectFourThree { image = cropToFourThree(image) }
-        image = applyLUT(to: image)
+        image = applyLUT(to: image, entry: savedLUT)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         // TIFF は 16bit で書き出し、10bit の Log フレーム（x422 など）の階調を落とさない
         let data = isTIFF
@@ -1176,7 +1190,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         lastRawLogStats = String(format: "黒 %.2f / 中央 %.2f / 白 %.2f",
                                  encoded.black, encoded.median, encoded.white)
         var logImage = CIImage(cgImage: encoded.image)
-        logImage = applyLUT(to: logImage)
+        logImage = applyLUT(to: logImage, entry: savedLUT)
 
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         switch format {

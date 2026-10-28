@@ -21,7 +21,7 @@ targets:
       path: Info.plist
       properties:
         CFBundleShortVersionString: "1.12"
-        CFBundleVersion: "20"
+        CFBundleVersion: "21"
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -33,5 +33,5 @@ targets:
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
         MARKETING_VERSION: "1.12"
-        CURRENT_PROJECT_VERSION: "20"
+        CURRENT_PROJECT_VERSION: "21"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

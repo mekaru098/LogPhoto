@@ -553,6 +553,18 @@ struct ContentView: View {
                 .pickerStyle(.menu)
                 .tint(.white)
 
+                // LUT をプレビューだけに当てるか、保存にも焼き込むか
+                Button {
+                    camera.setBakeLUT(!camera.bakeLUTIntoFiles)
+                } label: {
+                    Text(camera.bakeLUTIntoFiles ? "保存にも" : "表示のみ")
+                        .font(.caption2.bold())
+                        .foregroundStyle(camera.bakeLUTIntoFiles ? .black : .white)
+                        .padding(.horizontal, 7).padding(.vertical, 6)
+                        .background(camera.bakeLUTIntoFiles ? Color.white : Color.white.opacity(0.14),
+                                    in: Capsule())
+                }
+
                 Button {
                     showLUTImporter = true
                 } label: {
