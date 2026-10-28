@@ -38,61 +38,52 @@ struct ContentView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
+            // プレビュー: フル画角は全面、4:3 は純正と同じく上に寄せて下の黒い領域に操作系を置く
             GeometryReader { geo in
-                CameraPreviewView(camera: camera)
-                    .frame(width: geo.size.width, height: geo.size.height)
-                    .gesture(
-                        MagnificationGesture()
-                            .onChanged { scale in
-                                if pinchStartZoom == nil {
-                                    pinchStartZoom = camera.zoomFactor
-                                    revealZoomSlider()
+                let rect = previewRect(in: geo.size, safeTop: geo.safeAreaInsets.top)
+                ZStack(alignment: .topLeading) {
+                    CameraPreviewView(camera: camera)
+                        .frame(width: rect.width, height: rect.height)
+                        .overlay {
+                            if showGrid { RuleOfThirdsGrid() }
+                        }
+                        .clipped()
+                        .gesture(
+                            MagnificationGesture()
+                                .onChanged { scale in
+                                    if pinchStartZoom == nil {
+                                        pinchStartZoom = camera.zoomFactor
+                                        revealZoomSlider()
+                                    }
+                                    let target = (pinchStartZoom ?? 1.0) * scale
+                                    camera.setZoom(target, ramp: false)
+                                    zoomLogUI = log2(Double(max(target, 0.01)))
+                                    keepZoomSliderVisible()
                                 }
-                                let target = (pinchStartZoom ?? 1.0) * scale
-                                camera.setZoom(target, ramp: false)
-                                zoomLogUI = log2(Double(max(target, 0.01)))
-                                keepZoomSliderVisible()
-                            }
-                            .onEnded { _ in
-                                pinchStartZoom = nil
-                                scheduleZoomSliderHide()
-                            }
-                    )
-                    .onTapGesture { location in
-                        handleFocusTap(at: location, in: geo.size)
-                    }
-            }
-            .ignoresSafeArea()
+                                .onEnded { _ in
+                                    pinchStartZoom = nil
+                                    scheduleZoomSliderHide()
+                                }
+                        )
+                        .onTapGesture { location in
+                            handleFocusTap(at: location, in: rect.size)
+                            focusReticle = CGPoint(x: location.x + rect.minX,
+                                                   y: location.y + rect.minY)
+                        }
+                        .offset(x: rect.minX, y: rect.minY)
 
-            if showGrid {
-                RuleOfThirdsGrid()
-                    .ignoresSafeArea()
-            }
-
-            // 4:3 画角のマスク（上下を暗くして撮影範囲を示す）
-            if camera.aspectFourThree {
-                GeometryReader { geo in
-                    let visibleHeight = min(geo.size.width * 4 / 3, geo.size.height)
-                    let barHeight = max((geo.size.height - visibleHeight) / 2, 0)
-                    VStack(spacing: 0) {
-                        Color.black.opacity(0.55).frame(height: barHeight)
-                        Spacer()
-                        Color.black.opacity(0.55).frame(height: barHeight)
+                    // タップAFの枠
+                    if let point = focusReticle {
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.yellow, lineWidth: 1.5)
+                            .frame(width: 72, height: 72)
+                            .scaleEffect(reticleScale)
+                            .position(point)
+                            .allowsHitTesting(false)
                     }
                 }
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
             }
-
-            // タップAFの枠
-            if let point = focusReticle {
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(Color.yellow, lineWidth: 1.5)
-                    .frame(width: 72, height: 72)
-                    .scaleEffect(reticleScale)
-                    .position(point)
-                    .allowsHitTesting(false)
-            }
+            .ignoresSafeArea()
 
             if flash {
                 Color.white.ignoresSafeArea()
@@ -244,16 +235,16 @@ struct ContentView: View {
     }
 
     // MARK: - ズーム操作（チップ常時表示、操作中だけスライダー）
+    /// チップは常時表示。スライダーはその上に別行で出る（ピンチ / チップのドラッグ /
+    /// 選択中チップのタップで開き、しばらく触らないと閉じる）。
     private var zoomControl: some View {
-        ZStack {
+        VStack(spacing: 10) {
+            if zoomSliderVisible {
+                zoomSliderBar
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
             zoomChips
-                .opacity(zoomSliderVisible ? 0 : 1)
-                .allowsHitTesting(!zoomSliderVisible)
-            zoomSliderBar
-                .opacity(zoomSliderVisible ? 1 : 0)
-                .allowsHitTesting(zoomSliderVisible)
         }
-        .frame(height: 44)
         .padding(.horizontal, 24)
         .animation(.easeInOut(duration: 0.18), value: zoomSliderVisible)
     }
@@ -270,8 +261,20 @@ struct ContentView: View {
                 let isActive = activePreset == preset
                 let showsLive = isActive && abs(camera.zoomFactor - preset) > 0.05
                 Button {
+                    if isActive, abs(camera.zoomFactor - preset) < 0.05 {
+                        // 選択中のチップをもう一度タップ → スライダーの開閉
+                        if zoomSliderVisible {
+                            zoomHideTask?.cancel()
+                            withAnimation(.easeInOut(duration: 0.18)) { zoomSliderVisible = false }
+                        } else {
+                            revealZoomSlider()
+                            scheduleZoomSliderHide(after: 4)
+                        }
+                        return
+                    }
                     camera.setZoom(preset, ramp: true, switchLensNow: true)
                     zoomLogUI = log2(Double(preset))
+                    if zoomSliderVisible { scheduleZoomSliderHide(after: 4) }
                 } label: {
                     Text(showsLive ? zoomLabel(camera.zoomFactor) : presetLabel(preset))
                         .font(.system(size: isActive ? 12 : 11, weight: .bold).monospacedDigit())
@@ -285,8 +288,7 @@ struct ContentView: View {
                 .buttonStyle(.plain)
             }
         }
-        .padding(5)
-        .background(.black.opacity(0.3), in: Capsule())
+        .padding(4)
         // チップの上を左右にドラッグすると倍率が変わり、スライダーが出る（純正風）
         .highPriorityGesture(
             DragGesture(minimumDistance: 12)
@@ -356,7 +358,7 @@ struct ContentView: View {
     }
 
     /// 最後の操作から 1.5 秒後にスライダーをしまう。
-    private func scheduleZoomSliderHide(after seconds: Double = 1.5) {
+    private func scheduleZoomSliderHide(after seconds: Double = 2.5) {
         zoomHideTask?.cancel()
         zoomHideTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
@@ -574,6 +576,15 @@ struct ContentView: View {
         .padding(.vertical, 10)
     }
 
+    /// プレビューの表示領域。4:3 のときは幅いっぱい・高さ 4/3 を上部バーの下に寄せ、
+    /// 残りの下側（黒）に倍率チップとシャッターを置く（純正カメラと同じ配置）。
+    private func previewRect(in size: CGSize, safeTop: CGFloat) -> CGRect {
+        guard camera.aspectFourThree else { return CGRect(origin: .zero, size: size) }
+        let height = min(size.width * 4 / 3, size.height)
+        let top = min(safeTop + 96, max(size.height - height - 230, 0))
+        return CGRect(x: 0, y: top, width: size.width, height: height)
+    }
+
     /// タップAF: プレビューの fill クロップを補正して画像上の正規化座標へ変換する。
     private func handleFocusTap(at location: CGPoint, in size: CGSize) {
         let frame = camera.previewFrameSize
@@ -590,7 +601,6 @@ struct ContentView: View {
             u = (1 - visible) / 2 + u * visible
         }
         camera.focusAt(previewPoint: CGPoint(x: u, y: v))
-        focusReticle = location
         reticleScale = 1.3
         withAnimation(.easeOut(duration: 0.25)) { reticleScale = 1.0 }
         Task {

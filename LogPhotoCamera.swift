@@ -185,6 +185,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
         session.beginConfiguration()
         session.sessionPreset = .inputPriority // カスタムフォーマットを優先
+        // 重要: これが true（既定）だと commitConfiguration のたびにセッションが
+        // activeColorSpace を sRGB/P3 に上書きし、Apple Log が外れる。
+        session.automaticallyConfiguresCaptureDeviceForWideColor = false
         if session.canAddInput(input) { session.addInput(input) }
 
         videoOutput.videoSettings = [
@@ -370,6 +373,14 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     /// フォーマット設定後の後処理: 可動範囲の公開、写真サイズ、状態表示、倍率の再適用
     /// （sessionQueue 上、session.commitConfiguration の後で呼ぶ）。
     private func finishDeviceConfiguration(_ device: AVCaptureDevice, hasLogFormat: Bool) {
+        // 念のため: commit 後に色空間が戻されていたら Log を掛け直す
+        if mode == .logFrame,
+           device.activeFormat.supportedColorSpaces.contains(.appleLog),
+           device.activeColorSpace != .appleLog,
+           (try? device.lockForConfiguration()) != nil {
+            device.activeColorSpace = .appleLog
+            device.unlockForConfiguration()
+        }
         let rangeFormat = device.activeFormat
         let isoLo = Double(rangeFormat.minISO)
         let isoHi = Double(rangeFormat.maxISO)
