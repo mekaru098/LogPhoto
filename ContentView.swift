@@ -11,7 +11,7 @@ struct ContentView: View {
     @State private var pinchStartZoom: CGFloat? = nil
     // 露出は UI 側 @State で持ち、onChange でカメラへ反映する
     @State private var exposureEV: Double = 0
-    @State private var zoomSliderValue: Double = 1.0
+    @State private var focusReticle: CGPoint? = nil
     @State private var showLUTImporter = false
     @State private var showLastPhoto = false
     @State private var shutterLog: Double = -6
@@ -21,20 +21,32 @@ struct ContentView: View {
                 set: { camera.selectLUT($0) })
     }
 
+    /// ズームスライダーはカメラの値へ直接つなぐ（往復の同期ループを作らない）。
+    private var zoomBinding: Binding<Double> {
+        Binding(get: { Double(camera.zoomFactor) },
+                set: { camera.setZoom(CGFloat($0), ramp: false) })
+    }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            CameraPreviewView(camera: camera)
-                .ignoresSafeArea()
-                .gesture(
-                    MagnificationGesture()
-                        .onChanged { scale in
-                            if pinchStartZoom == nil { pinchStartZoom = camera.zoomFactor }
-                            camera.setZoom((pinchStartZoom ?? 1.0) * scale, ramp: false)
-                        }
-                        .onEnded { _ in pinchStartZoom = nil }
-                )
+            GeometryReader { geo in
+                CameraPreviewView(camera: camera)
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .gesture(
+                        MagnificationGesture()
+                            .onChanged { scale in
+                                if pinchStartZoom == nil { pinchStartZoom = camera.zoomFactor }
+                                camera.setZoom((pinchStartZoom ?? 1.0) * scale, ramp: false)
+                            }
+                            .onEnded { _ in pinchStartZoom = nil }
+                    )
+                    .onTapGesture { location in
+                        handleFocusTap(at: location, in: geo.size)
+                    }
+            }
+            .ignoresSafeArea()
 
             if showGrid {
                 RuleOfThirdsGrid()
@@ -54,6 +66,15 @@ struct ContentView: View {
                 }
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
+            }
+
+            // タップAFの枠
+            if let point = focusReticle {
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.yellow, lineWidth: 1.5)
+                    .frame(width: 72, height: 72)
+                    .position(point)
+                    .allowsHitTesting(false)
             }
 
             if flash {
@@ -215,17 +236,9 @@ struct ContentView: View {
                             }
                         }
 
-                        Slider(value: $zoomSliderValue,
+                        Slider(value: zoomBinding,
                                in: Double(camera.zoomRange.lowerBound)...Double(camera.zoomRange.upperBound))
                             .tint(.white)
-                            .onChange(of: zoomSliderValue) { _, newValue in
-                                camera.setZoom(CGFloat(newValue), ramp: false)
-                            }
-                            .onChange(of: camera.zoomFactor) { _, newValue in
-                                if abs(zoomSliderValue - Double(newValue)) > 0.02 {
-                                    zoomSliderValue = Double(newValue)
-                                }
-                            }
 
                         Text(String(format: "%.1fx", camera.zoomFactor))
                             .font(.caption.monospacedDigit().bold())
@@ -369,6 +382,29 @@ struct ContentView: View {
                 }
                 .padding()
             }
+        }
+    }
+
+    /// タップAF: プレビーの fill クロップを補正して画像上の正規化座標へ変換する。
+    private func handleFocusTap(at location: CGPoint, in size: CGSize) {
+        let frame = camera.previewFrameSize
+        guard frame.width > 0, frame.height > 0, size.width > 0, size.height > 0 else { return }
+        let imgAspect = frame.width / frame.height
+        let viewAspect = size.width / size.height
+        var u = location.x / size.width
+        var v = location.y / size.height
+        if imgAspect < viewAspect {
+            let visible = imgAspect / viewAspect
+            v = (1 - visible) / 2 + v * visible
+        } else if imgAspect > viewAspect {
+            let visible = viewAspect / imgAspect
+            u = (1 - visible) / 2 + u * visible
+        }
+        camera.focusAt(previewPoint: CGPoint(x: u, y: v))
+        focusReticle = location
+        Task {
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            focusReticle = nil
         }
     }
 
