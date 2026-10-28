@@ -125,7 +125,21 @@ struct ContentView: View {
 
                 bottomBar
             }
+
+            // 設定パネル: シートではなく、プレビューの上に透ける半透明パネルとして重ねる
+            if showPanel {
+                // シャッター列と歯車は隠さない（パネルはその上に浮かぶ）
+                VStack(spacing: 0) {
+                    Spacer()
+                    settingsSheet
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 108)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .zIndex(2)
+            }
         }
+        .animation(.easeInOut(duration: 0.22), value: showPanel)
         .task {
             await camera.requestAndStart()
         }
@@ -144,9 +158,7 @@ struct ContentView: View {
         .onChange(of: camera.mode) { _, _ in
             camera.modeChanged()
         }
-        .sheet(isPresented: $showPanel) {
-            settingsSheet
-        }
+
         .onChange(of: camera.zoomFactor) { _, newValue in
             // 操作中でなければ、カメラ側の倍率にスライダー位置を合わせる
             if !isZoomEditing, chipDragStartZoom == nil, pinchStartZoom == nil {
@@ -480,8 +492,12 @@ struct ContentView: View {
             .padding(.bottom, 6)
             settingsPanel
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .background(Color.black.opacity(0.001)) // 背景はシートの素材に任せる
+        .padding(.bottom, 12)
+        .frame(maxWidth: .infinity)
+        .background(.ultraThinMaterial)
+        .background(Color.black.opacity(0.22))
+        .clipShape(RoundedRectangle(cornerRadius: 26))
+        .overlay(RoundedRectangle(cornerRadius: 26).stroke(.white.opacity(0.12), lineWidth: 1))
         .fileImporter(isPresented: $showLUTImporter,
                       allowedContentTypes: [UTType(filenameExtension: "cube") ?? .data],
                       allowsMultipleSelection: false) { result in
@@ -489,10 +505,7 @@ struct ContentView: View {
                 camera.importLUT(from: url)
             }
         }
-        .presentationDetents([.fraction(0.42), .medium])
-        .presentationDragIndicator(.visible)
-        .presentationBackground(.ultraThinMaterial)
-        .preferredColorScheme(.dark)
+        .environment(\.colorScheme, .dark)
     }
 
     private var settingsPanel: some View {

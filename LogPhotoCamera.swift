@@ -128,6 +128,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private var wideDevice: AVCaptureDevice?      // 広角（1x）
     private var ultraWideDevice: AVCaptureDevice? // 超広角（0.5x / マクロ）
     private var teleDevice: AVCaptureDevice?      // 望遠（5x など）
+    private var teleTooClose = false              // 望遠の最短距離より近い → 広角のクロップへ逃がす
+    private var teleRetryAt: Date = .distantPast  // 望遠へ戻す再試行の時刻（往復防止）
+    private var focusObservation: NSKeyValueObservation?
     private var lensScales: [String: CGFloat] = [:] // uniqueID → 表示倍率（広角 = 1）
     private var captureDevice: AVCaptureDevice?   // 現在の入力デバイス
     private var configuredMode: CaptureMode?      // 現在のフォーマットが対応しているモード
@@ -409,7 +412,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let currentISO = Double(device.iso)
         let currentSS = device.exposureDuration.seconds
         let logActive = device.activeColorSpace == .appleLog
+        installFocusObservation(for: device)
         let lensName = lensLabel(for: device)
+            + (teleTooClose && device.deviceType == .builtInWideAngleCamera ? "（近距離クロップ）" : "")
         DispatchQueue.main.async {
             self.focusStatus = "AF 自動"
             if isoHi > isoLo { self.isoRange = isoLo...isoHi }
@@ -455,8 +460,38 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private func desiredDevice() -> AVCaptureDevice? {
         if macroMode, let uw = ultraWideDevice { return uw }
         if desiredZoom < 1, let uw = ultraWideDevice { return uw }
-        if let tele = teleDevice, desiredZoom >= zoomScale(for: tele) { return tele }
+        if let tele = teleDevice, desiredZoom >= zoomScale(for: tele), !teleTooClose { return tele }
         return wideDevice ?? virtualDevice ?? ultraWideDevice
+    }
+
+    /// 望遠では AF の結果を監視し、レンズが最短位置（lensPosition ≈ 0）で止まったら
+    /// 「被写体が望遠の最短撮影距離より近い」と判断して広角のデジタルクロップへ逃がす
+    /// （純正カメラと同じ振る舞い）。シーンが変わったら望遠へ戻すのを試す。
+    private func installFocusObservation(for device: AVCaptureDevice) {
+        focusObservation = nil
+        guard device.deviceType == .builtInTelephotoCamera else { return }
+        focusObservation = device.observe(\.isAdjustingFocus, options: [.new]) { [weak self] dev, change in
+            guard let self, change.newValue == false else { return }
+            let position = dev.lensPosition
+            self.sessionQueue.async { [weak self] in
+                guard let self, self.captureDevice == dev, !self.manualMode, !self.teleTooClose else { return }
+                if position < 0.03 {
+                    self.teleTooClose = true
+                    self.teleRetryAt = Date().addingTimeInterval(3)
+                    self.setStatus("望遠の最短距離より近いので広角のクロップに切り替えました")
+                    self.reconcileInput()
+                }
+            }
+        }
+    }
+
+    /// 広角クロップへ逃げている間にシーンが変わったら、望遠へ戻せるか試す。
+    private func retryTelephotoIfNeeded() {
+        guard teleTooClose, Date() >= teleRetryAt,
+              let tele = teleDevice, desiredZoom >= zoomScale(for: tele) else { return }
+        teleTooClose = false
+        teleRetryAt = Date().addingTimeInterval(3)
+        reconcileInput()
     }
 
     /// 入力とフォーマットを現在の状態（レンズ・モード）に合わせる（sessionQueue 上で呼ぶ）。
@@ -795,6 +830,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         zoomRequestLock.unlock()
         guard let request else { return }
         desiredZoom = min(max(request.factor, zoomLower), zoomUpper)
+        if let tele = teleDevice, desiredZoom < zoomScale(for: tele) { teleTooClose = false }
         if desiredDevice() != captureDevice {
             zoomSwitchToken += 1
             if request.switchLensNow {
@@ -877,6 +913,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                   (notification.object as? AVCaptureDevice) == device,
                   !self.manualMode else { return }
             self.resetContinuousAutoFocus(device)
+            self.retryTelephotoIfNeeded()
         }
     }
 
@@ -1070,7 +1107,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             let fmt = self.fourCharCode(rawType)
             self.markRawStage("1 設定作成（\(fmt) \(dims.width)x\(dims.height) preset=\(self.rawUsesPhotoPreset ? "photo" : "input")）")
             let settings = AVCapturePhotoSettings(rawPixelFormatType: rawType)
-            settings.photoQualityPrioritization = .balanced
+            // 注意: RAW 用の設定で photoQualityPrioritization を設定すると
+            // -[AVCapturePhotoSettings setPhotoQualityPrioritization:] が例外を投げて落ちる
+            // （build 16 のクラッシュログで確認）。RAW では既定のままにする。
             // 可能な機種では無音化（日本向け端末では非対応のことが多い）
             if !self.shutterSoundEnabled, self.photoOutput.isShutterSoundSuppressionSupported {
                 settings.isShutterSoundSuppressionEnabled = true
