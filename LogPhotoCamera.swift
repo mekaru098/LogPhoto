@@ -4,7 +4,14 @@ import ImageIO
 import Photos
 import UIKit
 
-/// Log Photo v1.7 - iPhone 16 Pro / Apple Log（第1世代）向け
+/// Log Photo v1.8 - iPhone 16 Pro / Apple Log（第1世代）向け
+///
+/// v1.8 の変更:
+/// - RAW+Log の倍率がプレビューと一致しない問題を修正。静止画側のズームは
+///   写真コネクションの videoScaleAndCropFactor が担うため、ズーム操作時に
+///   そちらへも倍率を反映し、RAW セットアップ完了時にも再適用する。
+///   変換画像（DNG からの書き出し）は撮影時の倍率でセンタートリミングする。
+/// - UI のアイコン/ボタンを昔の iOS 風（光沢のあるスキューモーフィック調）に変更。
 ///
 /// v1.7 の変更:
 /// - RAW が有効にならない問題への段階対策: RAW用フォーマットへ切り替えた後、
@@ -101,6 +108,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private var captureDevice: AVCaptureDevice?  // 現在の入力デバイス
     private var rawSetupInFlight = false
     private var rawUsesPhotoPreset = false
+    private var pendingRawZoom: CGFloat = 1
 
     private let bufferLock = NSLock()
     private var latestBuffer: CVPixelBuffer?
@@ -294,6 +302,15 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
             rawSetupInFlight = false
             DispatchQueue.main.async { self.rawAvailable = true }
+            // 構成変更でリセットされ得る倍率を現在の表示値に合わせ直す
+            if let device = captureDevice {
+                let clamped = min(max(zoomFactor, device.minAvailableVideoZoomFactor),
+                                  device.maxAvailableVideoZoomFactor)
+                try? device.lockForConfiguration()
+                device.videoZoomFactor = clamped
+                device.unlockForConfiguration()
+                applyStillZoom(clamped)
+            }
             setStatus("RAW+Log の準備ができました")
             return
         }
@@ -549,8 +566,17 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 }
                 device.unlockForConfiguration()
                 DispatchQueue.main.async { self.zoomFactor = clamped }
+                // 静止画（RAW）側の倍率は写真コネクションのクロップ率が担うので両方に反映
+                self.applyStillZoom(clamped)
             } catch { }
         }
+    }
+
+    /// 写真コネクションへ倍率を反映する（sessionQueue 上で呼ぶ）。
+    private func applyStillZoom(_ factor: CGFloat) {
+        guard let connection = photoOutput.connection(with: .video) else { return }
+        connection.videoScaleAndCropFactor = min(max(factor, 1),
+                                                 connection.videoMaxScaleAndCropFactor)
     }
 
     // MARK: - シャッター（モードで振り分け）
@@ -596,6 +622,18 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         savePhotoData(data, completion: isTIFF
             ? "Log写真（TIFF）を保存しました（fmt \(formatCode)）"
             : "Log写真を保存しました（fmt \(formatCode)）")
+    }
+
+    /// 倍率 factor へのセンタートリミング。
+    private func centerCrop(_ image: CIImage, factor: CGFloat) -> CIImage {
+        let extent = image.extent
+        guard extent.width > 0, extent.height > 0, factor > 1 else { return image }
+        let w = extent.width / factor
+        let h = extent.height / factor
+        let rect = CGRect(x: extent.minX + (extent.width - w) / 2,
+                          y: extent.minY + (extent.height - h) / 2,
+                          width: w, height: h)
+        return image.cropped(to: rect)
     }
 
     /// 画角 4:3（縦向き 3:4）へのセンタートリミング。
@@ -675,6 +713,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             modeChanged()
             return
         }
+        pendingRawZoom = zoomFactor
         let settings = AVCapturePhotoSettings(
             rawPixelFormatType: rawType,
             processedFormat: [AVVideoCodecKey: AVVideoCodecType.hevc]
@@ -688,6 +727,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private func makeLogImageData(fromDNG data: Data) -> Data? {
         guard let rawFilter = CIRAWFilter(imageData: data, identifierHint: "dng"),
               var image = rawFilter.outputImage else { return nil }
+
+        // 撮影時の倍率に合わせてセンタートリミング（DNG 本体はフル画角のまま）
+        if pendingRawZoom > 1.01 {
+            image = centerCrop(image, factor: pendingRawZoom)
+        }
 
         // ハイライト側の情報を Log カーブに収めるため少し引いてから変換
         if let exposure = CIFilter(name: "CIExposureAdjust",

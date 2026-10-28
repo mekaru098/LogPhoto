@@ -67,15 +67,17 @@ struct ContentView: View {
                         Text(camera.appleLogAvailable ? "APPLE LOG" : "LOG 非対応")
                             .font(.caption2.bold())
                             .tracking(0.6)
+                            .foregroundStyle(.white)
                             .padding(.horizontal, 9).padding(.vertical, 5)
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .background(GlossyCapsule(active: false))
                     }
                     Spacer()
                     if showBadges {
                         Text("iPhone 16 Pro")
                             .font(.caption2)
+                            .foregroundStyle(.white)
                             .padding(.horizontal, 9).padding(.vertical, 5)
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .background(GlossyCapsule(active: false))
                     }
                     Button {
                         withAnimation(.easeInOut(duration: 0.2)) { showBadges.toggle() }
@@ -84,7 +86,7 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundStyle(.white)
                             .frame(width: 30, height: 30)
-                            .background(.black.opacity(0.35), in: Circle())
+                            .background(GlossyCircle(active: false))
                     }
                 }
                 .padding(.horizontal, 14)
@@ -118,27 +120,31 @@ struct ContentView: View {
                             .font(.caption.bold())
                             .foregroundStyle(camera.manualMode ? .black : .white)
                             .padding(.horizontal, 11).padding(.vertical, 7)
-                            .background(camera.manualMode ? Color.white : Color.white.opacity(0.14),
-                                        in: Capsule())
+                            .background(GlossyCapsule(active: camera.manualMode))
                         }
 
-                        Picker("形式", selection: $camera.outputFormat) {
+                        HStack(spacing: 2) {
                             ForEach(LogPhotoCamera.OutputFormat.allCases) { format in
-                                Text(format.rawValue).tag(format)
+                                Button {
+                                    camera.outputFormat = format
+                                } label: {
+                                    Text(format.rawValue)
+                                        .font(.caption.bold())
+                                        .foregroundStyle(camera.outputFormat == format ? .black : .white)
+                                        .frame(width: 52, height: 29)
+                                        .background(GlossyCapsule(active: camera.outputFormat == format))
+                                }
                             }
                         }
-                        .pickerStyle(.segmented)
-                        .colorScheme(.dark)
-                        .frame(width: 108)
 
                         Button {
                             camera.setAspectFourThree(!camera.aspectFourThree)
                         } label: {
                             Text(camera.aspectFourThree ? "4:3" : "フル")
                                 .font(.caption.bold())
-                                .foregroundStyle(.white)
+                                .foregroundStyle(camera.aspectFourThree ? .black : .white)
                                 .padding(.horizontal, 9).padding(.vertical, 7)
-                                .background(Color.white.opacity(0.14), in: Capsule())
+                                .background(GlossyCapsule(active: camera.aspectFourThree))
                         }
 
                         Picker("LUT", selection: lutSelection) {
@@ -165,9 +171,9 @@ struct ContentView: View {
                         } label: {
                             Image(systemName: "grid")
                                 .font(.body)
-                                .foregroundStyle(showGrid ? .white : .white.opacity(0.4))
+                                .foregroundStyle(showGrid ? .white : .white.opacity(0.45))
                                 .frame(width: 34, height: 34)
-                                .background(.white.opacity(0.12), in: Circle())
+                                .background(GlossyCircle(active: false))
                         }
 
                         Text("露出")
@@ -175,7 +181,7 @@ struct ContentView: View {
                             .foregroundStyle(.white)
 
                         Slider(value: $exposureEV, in: -2...2, step: 0.1)
-                            .tint(.white)
+                            .tint(retroBlue)
                             .onChange(of: exposureEV) { _, newValue in
                                 camera.applyExposureCompensation(newValue)
                             }
@@ -198,15 +204,14 @@ struct ContentView: View {
                                         .font(.caption2.bold())
                                         .foregroundStyle(isActive ? .black : .white)
                                         .frame(width: 33, height: 33)
-                                        .background(isActive ? Color.white : Color.white.opacity(0.14),
-                                                    in: Circle())
+                                        .background(GlossyCircle(active: isActive))
                                 }
                             }
                         }
 
                         Slider(value: $zoomSliderValue,
                                in: Double(camera.zoomRange.lowerBound)...Double(camera.zoomRange.upperBound))
-                            .tint(.white)
+                            .tint(retroBlue)
                             .onChange(of: zoomSliderValue) { _, newValue in
                                 camera.setZoom(CGFloat(newValue), ramp: false)
                             }
@@ -223,16 +228,23 @@ struct ContentView: View {
                     }
 
                     // 撮影モード切替（方式A / 方式B）
-                    Picker("撮影モード", selection: $camera.mode) {
-                        ForEach(LogPhotoCamera.CaptureMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
+                    HStack(spacing: 2) {
+                        ForEach(LogPhotoCamera.CaptureMode.allCases) { m in
+                            Button {
+                                camera.mode = m
+                            } label: {
+                                Text(m.rawValue)
+                                    .font(.subheadline.bold())
+                                    .foregroundStyle(camera.mode == m ? .black : .white)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 34)
+                                    .background(GlossyCapsule(active: camera.mode == m))
+                            }
                         }
                     }
-                    .pickerStyle(.segmented)
-                    .colorScheme(.dark)
                 }
                 .padding(14)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
+                .background(RetroPanel(cornerRadius: 24))
                 .overlay(RoundedRectangle(cornerRadius: 24)
                     .stroke(.white.opacity(0.10), lineWidth: 1))
                 .overlay(alignment: .topTrailing) {
@@ -281,9 +293,11 @@ struct ContentView: View {
                         camera.shutter()
                     } label: {
                         Circle()
-                            .strokeBorder(.white, lineWidth: 3.5)
+                            .strokeBorder(LinearGradient(colors: [Color(white: 0.96), Color(white: 0.42)],
+                                                         startPoint: .top, endPoint: .bottom),
+                                          lineWidth: 3.5)
                             .frame(width: 72, height: 72)
-                            .overlay(Circle().fill(.white).frame(width: 58, height: 58))
+                            .overlay(GlossyCircle(active: true).frame(width: 58, height: 58))
                     }
 
                     Spacer()
@@ -380,7 +394,7 @@ struct ContentView: View {
                 Slider(value: $shutterLog,
                        in: log2(camera.shutterRange.lowerBound)...log2(camera.shutterRange.upperBound),
                        step: 0.05)
-                    .tint(.white)
+                    .tint(retroBlue)
                     .onChange(of: shutterLog) { _, newValue in
                         camera.shutterSeconds = pow(2.0, newValue)
                         camera.updateManualExposure()
@@ -388,21 +402,21 @@ struct ContentView: View {
             }
             manualRow(label: "ISO", value: "\(Int(camera.isoValue))") {
                 Slider(value: $camera.isoValue, in: camera.isoRange, step: 1)
-                    .tint(.white)
+                    .tint(retroBlue)
                     .onChange(of: camera.isoValue) { _, _ in
                         camera.updateManualExposure()
                     }
             }
             manualRow(label: "焦点", value: focusLabel(camera.focusPosition)) {
                 Slider(value: $camera.focusPosition, in: 0...1, step: 0.01)
-                    .tint(.white)
+                    .tint(retroBlue)
                     .onChange(of: camera.focusPosition) { _, _ in
                         camera.updateManualFocus()
                     }
             }
             manualRow(label: "WB", value: "\(Int(camera.whiteBalanceKelvin))K") {
                 Slider(value: $camera.whiteBalanceKelvin, in: 2500...8000, step: 50)
-                    .tint(.white)
+                    .tint(retroBlue)
                     .onChange(of: camera.whiteBalanceKelvin) { _, _ in
                         camera.updateManualWhiteBalance()
                     }
@@ -410,7 +424,7 @@ struct ContentView: View {
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
+        .background(RetroPanel(cornerRadius: 20))
         .overlay(RoundedRectangle(cornerRadius: 20)
             .stroke(.white.opacity(0.10), lineWidth: 1))
         .padding(.horizontal, 12)
@@ -465,4 +479,69 @@ private struct RuleOfThirdsGrid: View {
 
 #Preview {
     ContentView()
+}
+
+// MARK: - 昔の iOS 風の見た目（光沢のあるスキューモーフィック調）
+
+/// スライダーのアクセント色（往年の iOS の水色）。
+private let retroBlue = Color(red: 0.36, green: 0.68, blue: 0.98)
+
+/// 光沢カプセル: 上半分にハイライトが入るグラデーション。
+private struct GlossyCapsule: View {
+    var active: Bool
+    var body: some View {
+        ZStack {
+            Capsule()
+                .fill(LinearGradient(
+                    colors: active ? [Color(white: 0.99), Color(white: 0.70)]
+                                   : [Color(white: 0.42), Color(white: 0.16)],
+                    startPoint: .top, endPoint: .bottom))
+            GeometryReader { geo in
+                Capsule()
+                    .fill(LinearGradient(
+                        colors: [.white.opacity(active ? 0.85 : 0.42), .white.opacity(0.03)],
+                        startPoint: .top, endPoint: .bottom))
+                    .frame(height: geo.size.height * 0.52)
+            }
+        }
+        .overlay(Capsule().stroke(.black.opacity(0.35), lineWidth: 0.8))
+    }
+}
+
+/// 光沢サークル（GlossyCapsule の円形版）。
+private struct GlossyCircle: View {
+    var active: Bool
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(LinearGradient(
+                    colors: active ? [Color(white: 0.99), Color(white: 0.70)]
+                                   : [Color(white: 0.42), Color(white: 0.16)],
+                    startPoint: .top, endPoint: .bottom))
+            GeometryReader { geo in
+                Circle()
+                    .fill(LinearGradient(
+                        colors: [.white.opacity(active ? 0.85 : 0.42), .white.opacity(0.03)],
+                        startPoint: .top, endPoint: .bottom))
+                    .frame(height: geo.size.height * 0.52)
+                    .frame(width: geo.size.width)
+            }
+        }
+        .overlay(Circle().stroke(.black.opacity(0.35), lineWidth: 0.8))
+    }
+}
+
+/// パネルの背景: 暗色グラデーション＋上部ハイライト。
+private struct RetroPanel: View {
+    var cornerRadius: CGFloat
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: cornerRadius)
+                .fill(LinearGradient(colors: [Color(white: 0.27), Color(white: 0.11)],
+                                     startPoint: .top, endPoint: .bottom))
+            RoundedRectangle(cornerRadius: cornerRadius)
+                .fill(LinearGradient(colors: [.white.opacity(0.22), .white.opacity(0.0)],
+                                     startPoint: .top, endPoint: .center))
+        }
+    }
 }
