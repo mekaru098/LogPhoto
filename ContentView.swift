@@ -92,6 +92,21 @@ struct ContentView: View {
             VStack {
                 topBar
                 zoomReadout
+                if let stage = camera.lastCrashStage {
+                    // 前回 RAW 撮影中に落ちた場合の切り分け表示（タップで消す）
+                    Button {
+                        camera.lastCrashStage = nil
+                    } label: {
+                        Text("前回 RAW 撮影中に終了 → 段階: \(stage)")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.black)
+                            .multilineTextAlignment(.leading)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(Color.yellow, in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
+                }
                 Spacer()
 
                 Text(camera.statusText)
@@ -190,6 +205,16 @@ struct ContentView: View {
                     .font(.caption2)
                     .padding(.horizontal, 9).padding(.vertical, 5)
                     .background(.ultraThinMaterial, in: Capsule())
+            }
+            // シャッター音の ON/OFF
+            Button {
+                camera.setShutterSound(!camera.shutterSoundEnabled)
+            } label: {
+                Image(systemName: camera.shutterSoundEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                    .font(.caption)
+                    .foregroundStyle(camera.shutterSoundEnabled ? .white : .yellow)
+                    .frame(width: 30, height: 30)
+                    .background(.black.opacity(0.35), in: Circle())
             }
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) { showBadges.toggle() }

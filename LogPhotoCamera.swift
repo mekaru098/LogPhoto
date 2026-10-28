@@ -88,9 +88,20 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     @Published var isoRange: ClosedRange<Double> = 50...1600
     @Published var shutterRange: ClosedRange<Double> = (1.0 / 8000)...1.0
 
+    /// シャッター音（Logフレームはアプリが鳴らす音、RAW はシステムの音を抑制できる機種のみ）
+    @Published var shutterSoundEnabled: Bool = UserDefaults.standard.object(forKey: "logphoto.shutterSound") as? Bool ?? true
+    /// 前回 RAW 撮影中に落ちた場合、その段階（クラッシュ原因の切り分け用）
+    @Published var lastCrashStage: String? = nil
+
     override init() {
         super.init()
         refreshLUTList()
+        // 前回の RAW 撮影が完了マークなしで終わっていれば、落ちた段階を表示する
+        if let stage = UserDefaults.standard.string(forKey: "logphoto.rawStage") {
+            lastCrashStage = stage
+            statusText = "前回 RAW 撮影中に落ちました（段階: \(stage)）"
+            UserDefaults.standard.removeObject(forKey: "logphoto.rawStage")
+        }
         NotificationCenter.default.addObserver(
             self, selector: #selector(subjectAreaDidChange(_:)),
             name: .AVCaptureDeviceSubjectAreaDidChange, object: nil)
@@ -892,9 +903,27 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     }
 
     // MARK: - シャッター（モードで振り分け）
+    func setShutterSound(_ on: Bool) {
+        shutterSoundEnabled = on
+        UserDefaults.standard.set(on, forKey: "logphoto.shutterSound")
+    }
+
+    /// RAW 撮影の進行段階を UserDefaults に残す（落ちたときの切り分け用）。
+    private func markRawStage(_ stage: String?) {
+        if let stage {
+            UserDefaults.standard.set(stage, forKey: "logphoto.rawStage")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "logphoto.rawStage")
+        }
+        UserDefaults.standard.synchronize()
+    }
+
     func shutter() {
-        // 純正と同じシャッター音（マナーモードでは鳴らない）
-        AudioServicesPlaySystemSound(1108)
+        // Logフレームはアプリ側で純正と同じ音を鳴らす（マナーモードでは鳴らない）。
+        // RAW はシステムが鳴らすのでここでは鳴らさない。
+        if mode == .logFrame, shutterSoundEnabled {
+            AudioServicesPlaySystemSound(1108)
+        }
         switch mode {
         case .logFrame: captureLogPhoto()
         case .rawLog: captureRawLogPhoto()
@@ -1037,9 +1066,18 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 return
             }
             self.pendingRawZoom = self.captureDevice?.videoZoomFactor ?? 1
+            let dims = self.photoOutput.maxPhotoDimensions
+            let fmt = self.fourCharCode(rawType)
+            self.markRawStage("1 設定作成（\(fmt) \(dims.width)x\(dims.height) preset=\(self.rawUsesPhotoPreset ? "photo" : "input")）")
             let settings = AVCapturePhotoSettings(rawPixelFormatType: rawType)
             settings.photoQualityPrioritization = .balanced
+            // 可能な機種では無音化（日本向け端末では非対応のことが多い）
+            if !self.shutterSoundEnabled, self.photoOutput.isShutterSoundSuppressionSupported {
+                settings.isShutterSoundSuppressionEnabled = true
+            }
+            self.markRawStage("2 capturePhoto 呼び出し（\(fmt) \(dims.width)x\(dims.height)）")
             self.photoOutput.capturePhoto(with: settings, delegate: self)
+            self.markRawStage("3 撮影要求済み・結果待ち")
             self.setStatus("RAW撮影中…")
         }
     }
@@ -1162,24 +1200,33 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
-        if error != nil { setStatus("RAW撮影に失敗しました"); return }
+        markRawStage("4 結果受信")
+        if let error {
+            markRawStage(nil)
+            setStatus("RAW撮影に失敗しました: \(error.localizedDescription)")
+            return
+        }
         guard let data = photo.fileDataRepresentation() else {
+            markRawStage(nil)
             setStatus("RAWデータが取得できませんでした")
             return
         }
         if photo.isRawPhoto {
             // (1) DNG そのまま保存 (2) Log変換画像も保存
+            markRawStage("5 DNG 保存（\(data.count / 1_000_000)MB）")
             savePhotoData(data,
                           uniformTypeIdentifier: "com.adobe.raw-image",
                           completion: "DNG（RAW）を保存しました")
             updateThumbnail(from: data)
             setStatus("DNG を保存。Log 変換中…")
+            markRawStage("6 Log 変換開始（\(data.count / 1_000_000)MB）")
             // 変換は重い（CIRAWFilter）ので撮影コールバックから外し、1 回ずつ直列に行う
             let format = outputFormat
             rawConversionQueue.async { [weak self] in
                 guard let self else { return }
                 autoreleasepool {
                     if let converted = self.makeLogImageData(fromDNG: data, format: format) {
+                        self.markRawStage("7 変換画像の保存")
                         self.updateThumbnail(from: converted)
                         self.savePhotoData(converted, completion: format == .tiff
                             ? "Log変換TIFFも保存しました"
@@ -1187,9 +1234,11 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
                     } else {
                         self.setStatus("DNG は保存。Log 変換は失敗しました")
                     }
+                    self.markRawStage(nil)
                 }
             }
         } else {
+            markRawStage(nil)
             updateThumbnail(from: data)
             savePhotoData(data, completion: "写真を保存しました")
         }
