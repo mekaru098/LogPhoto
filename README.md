@@ -102,7 +102,21 @@
   （RAW 撮影の変換画像はデバイス倍率でトリミング）
 - タップ AF 後にシーンが変わったら自動 AF/AE に戻るようにした（純正と同じ挙動）
 
-> 方式Bの Log 変換は Apple Log の厳密な変換ではなく近似です。実機での色検証は今後の課題です。
+## v1.12 build 14〜22 の変更（実機検証しながら）
+- Apple Log が外れていた問題を修正（session.automaticallyConfiguresCaptureDeviceForWideColor を OFF）
+- RAW 撮影のクラッシュを修正。AVFoundation の規則で Bayer RAW は
+  photoQualityPrioritization = .speed かつ videoZoomFactor = 1.0 が必須。RAW モードでは
+  デバイスの倍率を 1.0 に固定し、倍率はプレビューのクロップで表現する
+- 方式Bの Log 変換を Apple Log の公式 OETF（Apple Log Profile White Paper）に置き換え、
+  BT.2020 原色で符号化。Core Image のフィルタ連鎖では符号値が狂ったため CPU で画素ごとに計算
+- RAW を 48MP で撮れるようにした（設定の 12MP / 48MP）。変換は横帯ごとに処理してメモリを抑える
+- LUT は既定で「表示のみ」（保存は Log のまま）。「保存にも」で焼き込み
+- 望遠は被写体が最短距離より近いと広角のクロップへ自動で逃がす（純正と同じ）
+- 4:3 は純正と同じくプレビューを上に寄せ、下の黒い領域に操作系を置く配置
+- シャッター音の ON/OFF、RAW 撮影の段階記録（落ちた段階を次回起動時に表示）
+
+> 方式Bの Log 変換は Apple Log の OETF を使っていますが、RAW 現像の露出尺度（18% グレーの位置）は
+> 実機で確認中です。保存メッセージに出る 黒 / 中央 / 白 の符号値で判断できます。
 
 ## ビルド（Macなし・無料クラウド）
 このリポジトリに push すると GitHub Actions が自動でビルドします。

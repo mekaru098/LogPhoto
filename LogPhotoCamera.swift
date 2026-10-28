@@ -61,6 +61,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     @Published var activeLensName = "広角"      // 現在のレンズ名（検証表示用）
     @Published var frameFormatCode = ""        // プレビューフレームの画素形式（例: x422）
     @Published var rawAvailable = false
+    /// RAW を 48MP（センサーの最大）で撮る。OFF は 12MP。
+    @Published var rawHighResolution: Bool = UserDefaults.standard.bool(forKey: "logphoto.raw48")
+    @Published var rawMegapixels: Double = 0   // 現在の写真サイズ（検証表示用）
     @Published var statusText = "準備中…"
     @Published var mode: CaptureMode = .logFrame
     /// 表示倍率（レンズ基準: 広角 = 1x）。管理値 desiredZoom をそのまま公開する。
@@ -351,10 +354,26 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let dims = device.activeFormat.supportedMaxPhotoDimensions
         guard !dims.isEmpty else { return }
         func area(_ d: CMVideoDimensions) -> Int { Int(d.width) * Int(d.height) }
-        let limit = 13_000_000
-        let chosen = dims.filter { area($0) <= limit }.max { area($0) < area($1) }
-            ?? dims.min { area($0) < area($1) }
-        if let chosen { photoOutput.maxPhotoDimensions = chosen }
+        let chosen: CMVideoDimensions?
+        if mode == .rawLog, rawHighResolution {
+            chosen = dims.max { area($0) < area($1) } // 48MP（対応フォーマットなら）
+        } else {
+            let limit = 13_000_000
+            chosen = dims.filter { area($0) <= limit }.max { area($0) < area($1) }
+                ?? dims.min { area($0) < area($1) }
+        }
+        if let chosen {
+            photoOutput.maxPhotoDimensions = chosen
+            let mp = Double(area(chosen)) / 1_000_000
+            DispatchQueue.main.async { self.rawMegapixels = mp }
+        }
+    }
+
+    /// RAW の解像度切替（12MP / 48MP）。maxPhotoDimensions は動作中でも変更できる。
+    func setRawHighResolution(_ on: Bool) {
+        rawHighResolution = on
+        UserDefaults.standard.set(on, forKey: "logphoto.raw48")
+        sessionQueue.async { [weak self] in self?.applyMaxPhotoDimensions() }
     }
 
     /// モードに応じて Log 用 / RAW 用のフォーマットと色空間をデバイスに設定する
@@ -1189,9 +1208,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                                                  sixteenBit: format == .tiff) else { return nil }
         lastRawLogStats = String(format: "黒 %.2f / 中央 %.2f / 白 %.2f",
                                  encoded.black, encoded.median, encoded.white)
-        var logImage = CIImage(cgImage: encoded.image)
-        logImage = applyLUT(to: logImage, entry: savedLUT)
-
+        // LUT を焼き込まないなら CGImage を直接書き出す（48MP で余計なコピーを作らない）
+        guard let lut = savedLUT else {
+            return AppleLog.fileData(from: encoded.image, tiff: format == .tiff)
+        }
+        let logImage = applyLUT(to: CIImage(cgImage: encoded.image), entry: lut)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         switch format {
         case .jpeg:

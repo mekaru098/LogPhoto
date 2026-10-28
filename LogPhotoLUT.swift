@@ -1,5 +1,6 @@
 import CoreImage
 import Foundation
+import ImageIO
 
 /// .cube LUT の読み込み、CIColorCube 用データ生成、内蔵LUT、ユーザーLUTの保存管理。
 final class LUTStore {
@@ -163,7 +164,8 @@ enum AppleLog {
 
     /// リニア sRGB の CIImage を CPU で BT.2020 原色の Apple Log 符号値にして CGImage にする。
     /// Core Image のフィルタ連鎖は色空間の扱いが読みにくいので、画素を float で取り出して
-    /// 式どおりに計算する（12MP で float RGBA 192MB、autoreleasepool 内で使うこと）。
+    /// 式どおりに計算する。48MP でも落ちないよう、横帯（ストリップ）ごとに取り出して処理する
+    /// （float の作業バッファは 1 帯分だけ。出力は 8bit RGB で 48MP ≈ 144MB、16bit で 288MB）。
     /// sixteenBit = true なら 16bit RGB（TIFF 用）、false なら 8bit RGB（JPEG 用）。
     static func encodeOnCPU(linearSRGB image: CIImage, context: CIContext,
                             sixteenBit: Bool) -> Encoded? {
@@ -171,56 +173,66 @@ enum AppleLog {
         let width = Int(extent.width), height = Int(extent.height)
         guard width > 0, height > 0,
               let linearSpace = CGColorSpace(name: CGColorSpace.linearSRGB) else { return nil }
-        let count = width * height
-        var floats = [Float](repeating: 0, count: count * 4)
-        floats.withUnsafeMutableBytes { raw in
-            context.render(image, toBitmap: raw.baseAddress!, rowBytes: width * 16,
-                           bounds: extent, format: .RGBAf, colorSpace: linearSpace)
-        }
+        let bytesPerPixel = sixteenBit ? 6 : 3
+        let outRowBytes = width * bytesPerPixel
+        var out = [UInt8](repeating: 0, count: outRowBytes * height)
         // sRGB → BT.2020（リニア）
         let m: [Float] = [0.6274, 0.3293, 0.0433,
                           0.0691, 0.9195, 0.0114,
                           0.0164, 0.0880, 0.8956]
-        let bytesPerPixel = sixteenBit ? 6 : 3
-        var out = [UInt8](repeating: 0, count: count * bytesPerPixel)
-        // 統計用: 輝度の符号値をサンプリング
+        let stripRows = max(1, min(height, (64 * 1024 * 1024) / (width * 16))) // 1 帯 ≈ 64MB
+        var strip = [Float](repeating: 0, count: width * stripRows * 4)
         var samples: [Float] = []
-        samples.reserveCapacity(count / 64 + 1)
-        floats.withUnsafeBufferPointer { src in
-            out.withUnsafeMutableBufferPointer { dst in
-                for i in 0..<count {
-                    let r = src[i * 4], g = src[i * 4 + 1], b = src[i * 4 + 2]
-                    let r2 = m[0] * r + m[1] * g + m[2] * b
-                    let g2 = m[3] * r + m[4] * g + m[5] * b
-                    let b2 = m[6] * r + m[7] * g + m[8] * b
-                    let er = encode(r2), eg = encode(g2), eb = encode(b2)
-                    if i % 64 == 0 { samples.append(0.2627 * er + 0.6780 * eg + 0.0593 * eb) }
-                    if sixteenBit {
-                        let o = i * 6
-                        let vr = UInt16(er * 65535 + 0.5), vg = UInt16(eg * 65535 + 0.5), vb = UInt16(eb * 65535 + 0.5)
-                        dst[o] = UInt8(vr >> 8); dst[o + 1] = UInt8(vr & 0xff)
-                        dst[o + 2] = UInt8(vg >> 8); dst[o + 3] = UInt8(vg & 0xff)
-                        dst[o + 4] = UInt8(vb >> 8); dst[o + 5] = UInt8(vb & 0xff)
-                    } else {
-                        let o = i * 3
-                        dst[o] = UInt8(er * 255 + 0.5)
-                        dst[o + 1] = UInt8(eg * 255 + 0.5)
-                        dst[o + 2] = UInt8(eb * 255 + 0.5)
+        samples.reserveCapacity(width * height / 256 + 1)
+        var y0 = 0
+        while y0 < height {
+            let rows = min(stripRows, height - y0)
+            // CIImage の座標は下が原点。出力は上から詰めるので帯の位置を反転して取り出す。
+            let bounds = CGRect(x: extent.minX,
+                                y: extent.maxY - CGFloat(y0 + rows),
+                                width: CGFloat(width), height: CGFloat(rows))
+            strip.withUnsafeMutableBytes { raw in
+                context.render(image, toBitmap: raw.baseAddress!, rowBytes: width * 16,
+                               bounds: bounds, format: .RGBAf, colorSpace: linearSpace)
+            }
+            strip.withUnsafeBufferPointer { src in
+                out.withUnsafeMutableBufferPointer { dst in
+                    let count = width * rows
+                    for i in 0..<count {
+                        let r = src[i * 4], g = src[i * 4 + 1], b = src[i * 4 + 2]
+                        let r2 = m[0] * r + m[1] * g + m[2] * b
+                        let g2 = m[3] * r + m[4] * g + m[5] * b
+                        let b2 = m[6] * r + m[7] * g + m[8] * b
+                        let er = encode(r2), eg = encode(g2), eb = encode(b2)
+                        if i % 256 == 0 { samples.append(0.2627 * er + 0.6780 * eg + 0.0593 * eb) }
+                        let o = (y0 * width + i) * bytesPerPixel
+                        if sixteenBit {
+                            let vr = UInt16(er * 65535 + 0.5), vg = UInt16(eg * 65535 + 0.5), vb = UInt16(eb * 65535 + 0.5)
+                            dst[o] = UInt8(vr >> 8); dst[o + 1] = UInt8(vr & 0xff)
+                            dst[o + 2] = UInt8(vg >> 8); dst[o + 3] = UInt8(vg & 0xff)
+                            dst[o + 4] = UInt8(vb >> 8); dst[o + 5] = UInt8(vb & 0xff)
+                        } else {
+                            dst[o] = UInt8(er * 255 + 0.5)
+                            dst[o + 1] = UInt8(eg * 255 + 0.5)
+                            dst[o + 2] = UInt8(eb * 255 + 0.5)
+                        }
                     }
                 }
             }
+            y0 += rows
         }
-        floats = []
+        strip = []
         samples.sort()
         let black = samples.isEmpty ? 0 : samples[samples.count / 100]
         let median = samples.isEmpty ? 0 : samples[samples.count / 2]
         let white = samples.isEmpty ? 0 : samples[samples.count * 99 / 100]
         let data = Data(out)
+        out = []
         guard let provider = CGDataProvider(data: data as CFData),
               let cg = CGImage(width: width, height: height,
                                bitsPerComponent: sixteenBit ? 16 : 8,
                                bitsPerPixel: sixteenBit ? 48 : 24,
-                               bytesPerRow: width * bytesPerPixel,
+                               bytesPerRow: outRowBytes,
                                space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                bitmapInfo: CGBitmapInfo(rawValue: sixteenBit
                                    ? (CGImageAlphaInfo.none.rawValue | CGBitmapInfo.byteOrder16Big.rawValue)
@@ -228,5 +240,20 @@ enum AppleLog {
                                provider: provider, decode: nil, shouldInterpolate: false,
                                intent: .defaultIntent) else { return nil }
         return Encoded(image: cg, black: black, median: median, white: white)
+    }
+
+    /// CGImage をそのまま JPEG / TIFF にする（CIImage を経由せず、余計なコピーを作らない）。
+    static func fileData(from image: CGImage, tiff: Bool) -> Data? {
+        let out = NSMutableData()
+        let type = (tiff ? "public.tiff" : "public.jpeg") as CFString
+        guard let dest = CGImageDestinationCreateWithData(out, type, 1, nil) else { return nil }
+        if tiff {
+            CGImageDestinationAddImage(dest, image, nil)
+        } else {
+            CGImageDestinationAddImage(dest, image,
+                [kCGImageDestinationLossyCompressionQuality: 0.95] as CFDictionary)
+        }
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return out as Data
     }
 }

@@ -203,7 +203,8 @@ struct ContentView: View {
                     .padding(.horizontal, 9).padding(.vertical, 5)
                     .background(.ultraThinMaterial, in: Capsule())
                 if camera.mode == .rawLog {
-                    Text(camera.rawAvailable ? "RAW" : "RAW 準備中")
+                    Text(camera.rawAvailable
+                         ? String(format: "RAW %.0fMP", camera.rawMegapixels) : "RAW 準備中")
                         .font(.caption2.bold())
                         .tracking(0.6)
                         .foregroundStyle(camera.rawAvailable ? .white : .yellow)
@@ -613,14 +614,29 @@ struct ContentView: View {
                     .frame(width: 36, alignment: .trailing)
             }
 
-            // 撮影モード切替（方式A / 方式B）
-            Picker("撮影モード", selection: $camera.mode) {
-                ForEach(LogPhotoCamera.CaptureMode.allCases) { mode in
-                    Text(mode.rawValue).tag(mode)
+            // 撮影モード切替（方式A / 方式B）と RAW の解像度
+            HStack(spacing: 10) {
+                Picker("撮影モード", selection: $camera.mode) {
+                    ForEach(LogPhotoCamera.CaptureMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .colorScheme(.dark)
+
+                Button {
+                    camera.setRawHighResolution(!camera.rawHighResolution)
+                } label: {
+                    Text(camera.rawHighResolution ? "48MP" : "12MP")
+                        .font(.caption.bold().monospacedDigit())
+                        .foregroundStyle(camera.rawHighResolution ? .black : .white)
+                        .padding(.horizontal, 9).padding(.vertical, 7)
+                        .background(camera.rawHighResolution ? Color.white : Color.white.opacity(0.14),
+                                    in: Capsule())
+                }
+                .opacity(camera.mode == .rawLog ? 1 : 0.4)
+                .disabled(camera.mode != .rawLog)
             }
-            .pickerStyle(.segmented)
-            .colorScheme(.dark)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 10)
