@@ -4,7 +4,13 @@ import ImageIO
 import Photos
 import UIKit
 
-/// Log Photo v1.4 - iPhone 16 Pro / Apple Log（第1世代）向け
+/// Log Photo v1.5 - iPhone 16 Pro / Apple Log（第1世代）向け
+///
+/// v1.5 の変更:
+/// - マニュアルを押すとプレビューがちらつく/真っ暗になる問題を修正。
+///   実カメラへ切り替える際に RAW 用フォーマット探索まで走っていたのが原因で、
+///   探索は RAW+Log モードのときだけに限定した。あわせて探索方法を見直し
+///   （写真解像度の大きい順に試し、失敗時は Log フォーマットへ復帰）。
 ///
 /// 2つの撮影モード:
 /// - 方式A (.logFrame): Apple Log のビデオフレームをシャッター時に静止画保存
@@ -210,12 +216,14 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     }
 
     /// マニュアル / RAW が必要なときは実カメラ、それ以外は仮想デバイスへ。
+    /// RAW 用フォーマット探索は RAW+Log モードのときだけ行う
+    /// （マニュアルでも走らせるとフォーマット切替が多発してプレビューがちらつく）。
     private func reconcileInput(manual: Bool, mode: CaptureMode) {
         let wantsPhysical = manual || mode == .rawLog
         let target = wantsPhysical ? (physicalDevice ?? virtualDevice)
                                    : (virtualDevice ?? physicalDevice)
         guard let target, target != captureDevice else {
-            if wantsPhysical { ensureRawCapableFormat() }
+            if mode == .rawLog { ensureRawCapableFormat() }
             return
         }
         guard let newInput = try? AVCaptureDeviceInput(device: target) else { return }
@@ -226,35 +234,54 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         captureDevice = target
         applyVideoRotation()
         applyDeviceConfiguration(target)
-        if wantsPhysical { ensureRawCapableFormat() }
+        if mode == .rawLog { ensureRawCapableFormat() }
     }
 
     /// 実カメラで RAW が撮れるフォーマットを探して設定する（sessionQueue 上で呼ぶ）。
+    /// 写真の最大解像度が大きい順に試し、見つからなければ Log フォーマットへ戻す。
     private func ensureRawCapableFormat() {
         guard let device = captureDevice else { return }
         if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
             DispatchQueue.main.async { self.rawAvailable = true }
             return
         }
+        func photoArea(_ format: AVCaptureDevice.Format) -> Int {
+            format.supportedMaxPhotoDimensions
+                .map { Int($0.width) * Int($0.height) }.max() ?? 0
+        }
         let sorted = device.formats.sorted { a, b in
+            let areaA = photoArea(a)
+            let areaB = photoArea(b)
+            if areaA != areaB { return areaA > areaB }
             let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
             let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
             return Int(da.width) * Int(da.height) > Int(db.width) * Int(db.height)
         }
+        var found = false
         do {
             try device.lockForConfiguration()
             for format in sorted {
+                if format.supportedMaxPhotoDimensions.isEmpty { continue }
                 device.activeFormat = format
-                if format.supportedColorSpaces.contains(.appleLog) {
-                    device.activeColorSpace = .appleLog
+                device.activeColorSpace = format.supportedColorSpaces.contains(.appleLog)
+                    ? .appleLog
+                    : (format.supportedColorSpaces.first ?? device.activeColorSpace)
+                if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
+                    found = true
+                    break
                 }
-                if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty { break }
             }
             device.unlockForConfiguration()
         } catch { }
-        let hasRaw = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
-        DispatchQueue.main.async { self.rawAvailable = hasRaw }
-        if !hasRaw { setStatus("RAW 対応フォーマットが見つかりません") }
+        if found {
+            DispatchQueue.main.async { self.rawAvailable = true }
+            setStatus("RAW+Log の準備ができました")
+        } else {
+            // 見つからなければ Log フォーマットに復帰させる
+            applyDeviceConfiguration(device)
+            DispatchQueue.main.async { self.rawAvailable = false }
+            setStatus("RAW 対応フォーマットが見つかりません")
+        }
     }
 
     /// モード切替時に UI から呼ばれる。
@@ -376,13 +403,15 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     private func applyManualSettings() {
         guard let device = captureDevice else { return }
+        let seconds = min(max(shutterSeconds, shutterRange.lowerBound), shutterRange.upperBound)
+        let iso = Float(min(max(isoValue, isoRange.lowerBound), isoRange.upperBound))
         do {
             try device.lockForConfiguration()
             if device.isExposureModeSupported(.custom) {
                 device.setExposureModeCustom(
-                    duration: CMTimeMakeWithSeconds(shutterSeconds,
+                    duration: CMTimeMakeWithSeconds(seconds,
                                                     preferredTimescale: 1_000_000_000),
-                    iso: Float(isoValue), completionHandler: nil)
+                    iso: iso, completionHandler: nil)
             }
             if device.isFocusModeSupported(.locked) {
                 device.setFocusModeLocked(lensPosition: Float(focusPosition),

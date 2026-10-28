@@ -263,6 +263,12 @@ struct ContentView: View {
         .onChange(of: camera.manualMode) { _, isOn in
             if isOn { shutterLog = log2(max(camera.shutterSeconds, 0.0001)) }
         }
+        .onChange(of: camera.shutterSeconds) { _, newValue in
+            // デバイス切替などでカメラ側の値が更新されたらスライダー位置も合わせる
+            if camera.manualMode {
+                shutterLog = log2(max(newValue, 0.0001))
+            }
+        }
         .onChange(of: camera.mode) { _, _ in
             camera.modeChanged()
         }
