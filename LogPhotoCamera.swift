@@ -4,13 +4,18 @@ import ImageIO
 import Photos
 import UIKit
 
-/// Log Photo v1.5 - iPhone 16 Pro / Apple Log（第1世代）向け
+/// Log Photo v1.6 - iPhone 16 Pro / Apple Log（第1世代）向け
+///
+/// v1.6 の変更:
+/// - RAW+Log でちらつく問題を修正。フォーマット探索のループをやめ、
+///   写真の最大解像度が最大のフォーマットへ1回だけ切り替える方式にした。
+///   あわせて、その際に Log 色空間を強制しないようにした（Log 色空間の
+///   ままでは RAW が有効にならない可能性があった）。
 ///
 /// v1.5 の変更:
 /// - マニュアルを押すとプレビューがちらつく/真っ暗になる問題を修正。
 ///   実カメラへ切り替える際に RAW 用フォーマット探索まで走っていたのが原因で、
-///   探索は RAW+Log モードのときだけに限定した。あわせて探索方法を見直し
-///   （写真解像度の大きい順に試し、失敗時は Log フォーマットへ復帰）。
+///   探索は RAW+Log モードのときだけに限定した。
 ///
 /// 2つの撮影モード:
 /// - 方式A (.logFrame): Apple Log のビデオフレームをシャッター時に静止画保存
@@ -237,50 +242,42 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         if mode == .rawLog { ensureRawCapableFormat() }
     }
 
-    /// 実カメラで RAW が撮れるフォーマットを探して設定する（sessionQueue 上で呼ぶ）。
-    /// 写真の最大解像度が大きい順に試し、見つからなければ Log フォーマットへ戻す。
+    private func photoArea(_ format: AVCaptureDevice.Format) -> Int {
+        format.supportedMaxPhotoDimensions
+            .map { Int($0.width) * Int($0.height) }.max() ?? 0
+    }
+
+    /// 実カメラを RAW 撮影用のフォーマットに切り替える（sessionQueue 上で呼ぶ）。
+    /// ループ探索はしない: 写真の最大解像度が最大のフォーマットへ1回だけ切り替え、
+    /// 色空間は Log 以外を選ぶ（Log 色空間のままだと RAW が有効にならない疑い）。
+    /// それでも RAW が有効にならなければ Log フォーマットへ復帰する。
     private func ensureRawCapableFormat() {
         guard let device = captureDevice else { return }
         if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
             DispatchQueue.main.async { self.rawAvailable = true }
             return
         }
-        func photoArea(_ format: AVCaptureDevice.Format) -> Int {
-            format.supportedMaxPhotoDimensions
-                .map { Int($0.width) * Int($0.height) }.max() ?? 0
-        }
-        let sorted = device.formats.sorted { a, b in
-            let areaA = photoArea(a)
-            let areaB = photoArea(b)
-            if areaA != areaB { return areaA > areaB }
-            let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
-            let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
-            return Int(da.width) * Int(da.height) > Int(db.width) * Int(db.height)
-        }
-        var found = false
-        do {
-            try device.lockForConfiguration()
-            for format in sorted {
-                if format.supportedMaxPhotoDimensions.isEmpty { continue }
-                device.activeFormat = format
-                device.activeColorSpace = format.supportedColorSpaces.contains(.appleLog)
-                    ? .appleLog
-                    : (format.supportedColorSpaces.first ?? device.activeColorSpace)
-                if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
-                    found = true
-                    break
-                }
-            }
-            device.unlockForConfiguration()
-        } catch { }
-        if found {
-            DispatchQueue.main.async { self.rawAvailable = true }
-            setStatus("RAW+Log の準備ができました")
-        } else {
-            // 見つからなければ Log フォーマットに復帰させる
-            applyDeviceConfiguration(device)
+        guard let format = device.formats.max(by: { photoArea($0) < photoArea($1) }),
+              !format.supportedMaxPhotoDimensions.isEmpty else {
             DispatchQueue.main.async { self.rawAvailable = false }
             setStatus("RAW 対応フォーマットが見つかりません")
+            return
+        }
+        do {
+            try device.lockForConfiguration()
+            device.activeFormat = format
+            let nonLog = format.supportedColorSpaces.first { $0 != .appleLog }
+                ?? format.supportedColorSpaces.first
+            if let nonLog { device.activeColorSpace = nonLog }
+            device.unlockForConfiguration()
+        } catch { }
+        if photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
+            applyDeviceConfiguration(device)
+            DispatchQueue.main.async { self.rawAvailable = false }
+            setStatus("この構成では RAW が使えませんでした")
+        } else {
+            DispatchQueue.main.async { self.rawAvailable = true }
+            setStatus("RAW+Log の準備ができました")
         }
     }
 
