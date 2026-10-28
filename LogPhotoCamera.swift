@@ -4,27 +4,22 @@ import ImageIO
 import Photos
 import UIKit
 
-/// Log Photo v1.3 - iPhone 16 Pro / Apple Log（第1世代）向け
+/// Log Photo v1.4 - iPhone 16 Pro / Apple Log（第1世代）向け
 ///
 /// 2つの撮影モード:
-/// - 方式A (.logFrame): Apple Log のビデオフレームをシャッター時に静止画保存（v0から継続）
+/// - 方式A (.logFrame): Apple Log のビデオフレームをシャッター時に静止画保存
 /// - 方式B (.rawLog): Bayer RAW で撮影し、(1) DNG をそのまま保存、
-///   (2) RAW を現像して Log カーブ（近似）で変換した JPEG も保存する
+///   (2) RAW を現像して Log カーブ（近似）で変換した画像も保存する
 ///
-/// v1.1: 露出補正（-2EV〜+2EV）と三分割グリッドを追加。
-/// v1.2: ズーム対応（トリプルカメラ、0.5/1/2/5 ボタン＋ピンチ）。
-/// v1.3 の変更:
-/// - 露出スライダーを触ると落ちる問題の対策: UI 側の @State から onChange で
-///   反映する形に変え、カメラ側からの書き戻しをやめた。
-/// - 方式Aの保存を再対策: BGRA 以外のフレーム形式では従来の色管理あり変換に
-///   黙ってフォールバックして通常写真化していた。色管理なし（ワーキング
-///   カラースペース null）の CI レンダリングに統一し、保存時のステータスに
-///   フレーム形式（fmt）を表示して切り分けできるようにした。
-/// - ズームスライダーを追加（仮想デバイスがレンズ切替を自動で行う）。
-/// - 保存形式に TIFF を追加（方式Bは 16bit TIFF）。
-/// - マニュアル撮影（SS / ISO / フォーカス / WB）を追加。
-/// - LUT 対応: 内蔵LUT（近似変換・モノクロ）と .cube ファイルの読み込み。
-///   選択した LUT は保存時に適用する。
+/// v1.4 の変更:
+/// - プレビューを自前レンダリング（Core Image + Metal）に変更。選択中の LUT が
+///   プレビューにも反映され、保存される Log の見た目がそのまま見える。
+/// - マニュアル撮影と RAW 撮影では、入力を実カメラ（広角）に切り替える。
+///   仮想デバイス（トリプルカメラ）ではマニュアル系 API が強制終了したり
+///   RAW が使えなかったりしたための対策。通常時は仮想デバイスでズームを使う。
+/// - 露出補正（ターゲットバイアス）を lockForConfiguration で囲んだ
+///   （露出バーを触ると落ちる問題への対策）。
+/// - 最後に撮った写真のサムネイルを保持する（UI の左下プレビュー用）。
 /// 方式Bの Log 変換は Apple Log の厳密な OETF ではなく近似カーブ。
 final class LogPhotoCamera: NSObject, ObservableObject {
 
@@ -48,15 +43,18 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     @Published var zoomPresets: [CGFloat] = [1.0]
     @Published var zoomRange: ClosedRange<CGFloat> = 1.0...1.0
     private var maxZoomFactor: CGFloat = 1.0
+    @Published var lastThumbnail: UIImage?
 
-    // v1.3: 保存形式と LUT
+    // 保存形式と LUT
     @Published var outputFormat: OutputFormat = .jpeg
     @Published var lutNames: [String] = ["なし"]
     @Published var selectedLUTName: String = "なし"
     private let lutStore = LUTStore()
     private var lutEntries: [String: LUTStore.Entry] = [:]
+    private let lutLock = NSLock()
+    private var activeLUTSnapshot: LUTStore.Entry?
 
-    // v1.3: マニュアル撮影
+    // マニュアル撮影
     @Published var manualMode = false
     @Published var shutterSeconds: Double = 1.0 / 60
     @Published var isoValue: Double = 100
@@ -78,7 +76,10 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     /// 色管理変換をしないレンダリング用（Log の画素値をそのまま書き出すため）
     private let rawContext = CIContext(options: [.workingColorSpace: NSNull(),
                                                   .outputColorSpace: NSNull()])
-    private var captureDevice: AVCaptureDevice?
+
+    private var virtualDevice: AVCaptureDevice?  // トリプル/デュアル（ズーム用）
+    private var physicalDevice: AVCaptureDevice? // 広角の実カメラ（マニュアル/RAW用）
+    private var captureDevice: AVCaptureDevice?  // 現在の入力デバイス
 
     private let bufferLock = NSLock()
     private var latestBuffer: CVPixelBuffer?
@@ -111,19 +112,24 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         guard !configured else { return }
         configured = true
 
-        // ズーム用に仮想デバイス（トリプル→デュアル→広角の順で優先）。
-        // 仮想デバイスで Log フォーマットが取れない場合は広角にフォールバックする。
         let discovery = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.builtInTripleCamera, .builtInDualCamera, .builtInWideAngleCamera],
             mediaType: .video, position: .back)
-        var chosenDevice = discovery.devices.first
-        if let candidate = chosenDevice,
-           !candidate.formats.contains(where: { $0.supportedColorSpaces.contains(.appleLog) }),
-           let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-           wide.formats.contains(where: { $0.supportedColorSpaces.contains(.appleLog) }) {
-            chosenDevice = wide
+        virtualDevice = discovery.devices.first {
+            $0.deviceType == .builtInTripleCamera || $0.deviceType == .builtInDualCamera
         }
-        guard let device = chosenDevice,
+        physicalDevice = AVCaptureDevice.default(.builtInWideAngleCamera,
+                                                 for: .video, position: .back)
+        if physicalDevice == nil { physicalDevice = discovery.devices.first }
+        // 仮想デバイスに Log がなければ最初から実カメラを使う
+        var startDevice = virtualDevice ?? physicalDevice
+        if let candidate = startDevice,
+           !candidate.formats.contains(where: { $0.supportedColorSpaces.contains(.appleLog) }),
+           let wide = physicalDevice,
+           wide.formats.contains(where: { $0.supportedColorSpaces.contains(.appleLog) }) {
+            startDevice = wide
+        }
+        guard let device = startDevice,
               let input = try? AVCaptureDeviceInput(device: device) else {
             setStatus("カメラが見つかりません")
             return
@@ -131,7 +137,6 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         captureDevice = device
 
         session.beginConfiguration()
-        defer { session.commitConfiguration() }
         session.sessionPreset = .inputPriority // カスタムフォーマットを優先
         if session.canAddInput(input) { session.addInput(input) }
 
@@ -142,18 +147,23 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
         videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "logphoto.frames"))
 
-        if session.canAddOutput(photoOutput) {
-            session.addOutput(photoOutput)
-            let hasRaw = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
-            DispatchQueue.main.async { self.rawAvailable = hasRaw }
-        }
+        if session.canAddOutput(photoOutput) { session.addOutput(photoOutput) }
+        session.commitConfiguration()
 
+        applyVideoRotation()
+        applyDeviceConfiguration(device)
+    }
+
+    /// 入力切替のたびにビデオ出力の回転（縦向き）を再適用する。
+    private func applyVideoRotation() {
         if let connection = videoOutput.connection(with: .video),
            connection.isVideoRotationAngleSupported(90) {
             connection.videoRotationAngle = 90 // 縦向き
         }
+    }
 
-        // Apple Log 対応フォーマットのうち最大解像度を選ぶ（16 Pro は Log 第1世代）
+    /// デバイスの Log フォーマット選択と、可動範囲の公開（sessionQueue 上で呼ぶ）。
+    private func applyDeviceConfiguration(_ device: AVCaptureDevice) {
         let logFormat = device.formats
             .filter { $0.supportedColorSpaces.contains(.appleLog) }
             .max { a, b in
@@ -161,7 +171,6 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
                 return Int(da.width) * Int(da.height) < Int(db.width) * Int(db.height)
             }
-
         do {
             try device.lockForConfiguration()
             if let logFormat {
@@ -172,13 +181,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             } else {
                 setStatus("この機種/レンズは Apple Log 非対応です")
             }
-            // ズーム範囲とプリセット（純正風: 0.5 / 1 / 2 / 5、範囲外は除外）
             let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 15.0)
             let presets = [CGFloat(0.5), 1.0, 2.0, 5.0].filter {
                 $0 >= device.minAvailableVideoZoomFactor - 0.001 && $0 <= maxZoom
             }
             let initialZoom = device.videoZoomFactor
-            // マニュアル撮影の可動範囲
             let rangeFormat = logFormat ?? device.activeFormat
             let isoLo = Double(rangeFormat.minISO)
             let isoHi = Double(rangeFormat.maxISO)
@@ -202,6 +209,73 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
     }
 
+    /// マニュアル / RAW が必要なときは実カメラ、それ以外は仮想デバイスへ。
+    private func reconcileInput(manual: Bool, mode: CaptureMode) {
+        let wantsPhysical = manual || mode == .rawLog
+        let target = wantsPhysical ? (physicalDevice ?? virtualDevice)
+                                   : (virtualDevice ?? physicalDevice)
+        guard let target, target != captureDevice else {
+            if wantsPhysical { ensureRawCapableFormat() }
+            return
+        }
+        guard let newInput = try? AVCaptureDeviceInput(device: target) else { return }
+        session.beginConfiguration()
+        for input in session.inputs { session.removeInput(input) }
+        if session.canAddInput(newInput) { session.addInput(newInput) }
+        session.commitConfiguration()
+        captureDevice = target
+        applyVideoRotation()
+        applyDeviceConfiguration(target)
+        if wantsPhysical { ensureRawCapableFormat() }
+    }
+
+    /// 実カメラで RAW が撮れるフォーマットを探して設定する（sessionQueue 上で呼ぶ）。
+    private func ensureRawCapableFormat() {
+        guard let device = captureDevice else { return }
+        if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
+            DispatchQueue.main.async { self.rawAvailable = true }
+            return
+        }
+        let sorted = device.formats.sorted { a, b in
+            let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
+            let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
+            return Int(da.width) * Int(da.height) > Int(db.width) * Int(db.height)
+        }
+        do {
+            try device.lockForConfiguration()
+            for format in sorted {
+                device.activeFormat = format
+                if format.supportedColorSpaces.contains(.appleLog) {
+                    device.activeColorSpace = .appleLog
+                }
+                if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty { break }
+            }
+            device.unlockForConfiguration()
+        } catch { }
+        let hasRaw = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
+        DispatchQueue.main.async { self.rawAvailable = hasRaw }
+        if !hasRaw { setStatus("RAW 対応フォーマットが見つかりません") }
+    }
+
+    /// モード切替時に UI から呼ばれる。
+    func modeChanged() {
+        let currentMode = mode
+        let manual = manualMode
+        sessionQueue.async { [weak self] in
+            self?.reconcileInput(manual: manual, mode: currentMode)
+        }
+    }
+
+    // MARK: - プレビュー用（LUT 適用済みフレーム）
+    /// プレビュー表示用に、最新フレームへ選択中 LUT を適用した CIImage を返す。
+    func currentPreviewImage() -> CIImage? {
+        bufferLock.lock()
+        let buffer = latestBuffer
+        bufferLock.unlock()
+        guard let buffer else { return nil }
+        return applyLUT(to: CIImage(cvPixelBuffer: buffer))
+    }
+
     // MARK: - LUT
     func refreshLUTList() {
         lutStore.reload()
@@ -215,11 +289,13 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         lutNames = ["なし", log709.name, mono.name] + lutStore.userLUTs.map { $0.name }
         let stored = UserDefaults.standard.string(forKey: "logphoto.selectedLUT")
         selectedLUTName = (stored != nil && entries[stored!] != nil) ? stored! : "なし"
+        setActiveLUTSnapshot(entries[selectedLUTName])
     }
 
     func selectLUT(_ name: String) {
         selectedLUTName = name
         UserDefaults.standard.set(name, forKey: "logphoto.selectedLUT")
+        setActiveLUTSnapshot(lutEntries[name])
     }
 
     func importLUT(from url: URL) {
@@ -232,7 +308,17 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
     }
 
-    private var activeLUT: LUTStore.Entry? { lutEntries[selectedLUTName] }
+    private func setActiveLUTSnapshot(_ entry: LUTStore.Entry?) {
+        lutLock.lock()
+        activeLUTSnapshot = entry
+        lutLock.unlock()
+    }
+
+    private var activeLUT: LUTStore.Entry? {
+        lutLock.lock()
+        defer { lutLock.unlock() }
+        return activeLUTSnapshot
+    }
 
     private func applyLUT(to image: CIImage) -> CIImage {
         guard let lut = activeLUT,
@@ -245,43 +331,75 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     }
 
     // MARK: - 露出補正
-    /// カメラの露出ターゲットをずらす。UI の @State から onChange 経由で呼ばれる。
-    /// カメラ側から UI へ値を書き戻さない（v1.2 までの書き戻しがクラッシュの
-    /// 原因候補だったため）。
+    /// 露出ターゲットバイアス。lockForConfiguration で囲んで安全に適用する。
     func applyExposureCompensation(_ ev: Double) {
-        sessionQueue.async { [weak self] in
-            guard let self, let device = self.captureDevice else { return }
-            let clamped = max(Double(device.minExposureTargetBias),
-                              min(Double(device.maxExposureTargetBias), ev))
-            device.setExposureTargetBias(Float(clamped), completionHandler: nil)
-        }
-    }
-
-    // MARK: - マニュアル撮影
-    func setManualMode(_ on: Bool) {
-        manualMode = on
-        if on {
-            updateManualExposure()
-            updateManualFocus()
-            updateManualWhiteBalance()
-            return
-        }
         sessionQueue.async { [weak self] in
             guard let self, let device = self.captureDevice else { return }
             do {
                 try device.lockForConfiguration()
-                if device.isExposureModeSupported(.continuousAutoExposure) {
-                    device.exposureMode = .continuousAutoExposure
-                }
-                if device.isFocusModeSupported(.continuousAutoFocus) {
-                    device.focusMode = .continuousAutoFocus
-                }
-                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
-                    device.whiteBalanceMode = .continuousAutoWhiteBalance
-                }
+                let clamped = max(Double(device.minExposureTargetBias),
+                                  min(Double(device.maxExposureTargetBias), ev))
+                device.setExposureTargetBias(Float(clamped), completionHandler: nil)
                 device.unlockForConfiguration()
             } catch { }
         }
+    }
+
+    // MARK: - マニュアル撮影（実カメラでのみ使う）
+    func setManualMode(_ on: Bool) {
+        manualMode = on
+        let currentMode = mode
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            if !on, let device = self.captureDevice {
+                // 先に現在のデバイスをオートへ戻してから入力を切り替える
+                do {
+                    try device.lockForConfiguration()
+                    if device.isExposureModeSupported(.continuousAutoExposure) {
+                        device.exposureMode = .continuousAutoExposure
+                    }
+                    if device.isFocusModeSupported(.continuousAutoFocus) {
+                        device.focusMode = .continuousAutoFocus
+                    }
+                    if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                        device.whiteBalanceMode = .continuousAutoWhiteBalance
+                    }
+                    device.unlockForConfiguration()
+                } catch { }
+            }
+            self.reconcileInput(manual: on, mode: currentMode)
+            if on {
+                self.applyManualSettings()
+            }
+        }
+    }
+
+    private func applyManualSettings() {
+        guard let device = captureDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            if device.isExposureModeSupported(.custom) {
+                device.setExposureModeCustom(
+                    duration: CMTimeMakeWithSeconds(shutterSeconds,
+                                                    preferredTimescale: 1_000_000_000),
+                    iso: Float(isoValue), completionHandler: nil)
+            }
+            if device.isFocusModeSupported(.locked) {
+                device.setFocusModeLocked(lensPosition: Float(focusPosition),
+                                          completionHandler: nil)
+            }
+            if device.isWhiteBalanceModeSupported(.locked) {
+                let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
+                    temperature: Float(whiteBalanceKelvin), tint: 0)
+                var gains = device.deviceWhiteBalanceGains(for: values)
+                let maxGain = device.maxWhiteBalanceGain
+                gains.redGain = min(max(gains.redGain, 1), maxGain)
+                gains.greenGain = min(max(gains.greenGain, 1), maxGain)
+                gains.blueGain = min(max(gains.blueGain, 1), maxGain)
+                device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+            }
+            device.unlockForConfiguration()
+        } catch { }
     }
 
     func updateManualExposure() {
@@ -290,9 +408,16 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let iso = Float(isoValue)
         sessionQueue.async { [weak self] in
             guard let self, let device = self.captureDevice else { return }
-            device.setExposureModeCustom(
-                duration: CMTimeMakeWithSeconds(seconds, preferredTimescale: 1_000_000_000),
-                iso: iso, completionHandler: nil)
+            do {
+                try device.lockForConfiguration()
+                if device.isExposureModeSupported(.custom) {
+                    device.setExposureModeCustom(
+                        duration: CMTimeMakeWithSeconds(seconds,
+                                                        preferredTimescale: 1_000_000_000),
+                        iso: iso, completionHandler: nil)
+                }
+                device.unlockForConfiguration()
+            } catch { }
         }
     }
 
@@ -301,7 +426,13 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let position = Float(focusPosition)
         sessionQueue.async { [weak self] in
             guard let self, let device = self.captureDevice else { return }
-            device.setFocusModeLocked(lensPosition: position, completionHandler: nil)
+            do {
+                try device.lockForConfiguration()
+                if device.isFocusModeSupported(.locked) {
+                    device.setFocusModeLocked(lensPosition: position, completionHandler: nil)
+                }
+                device.unlockForConfiguration()
+            } catch { }
         }
     }
 
@@ -310,19 +441,25 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let kelvin = Float(whiteBalanceKelvin)
         sessionQueue.async { [weak self] in
             guard let self, let device = self.captureDevice else { return }
-            let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
-                temperature: kelvin, tint: 0)
-            var gains = device.deviceWhiteBalanceGains(for: values)
-            let maxGain = device.maxWhiteBalanceGain
-            gains.redGain = min(max(gains.redGain, 1), maxGain)
-            gains.greenGain = min(max(gains.greenGain, 1), maxGain)
-            gains.blueGain = min(max(gains.blueGain, 1), maxGain)
-            device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+            do {
+                try device.lockForConfiguration()
+                if device.isWhiteBalanceModeSupported(.locked) {
+                    let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
+                        temperature: kelvin, tint: 0)
+                    var gains = device.deviceWhiteBalanceGains(for: values)
+                    let maxGain = device.maxWhiteBalanceGain
+                    gains.redGain = min(max(gains.redGain, 1), maxGain)
+                    gains.greenGain = min(max(gains.greenGain, 1), maxGain)
+                    gains.blueGain = min(max(gains.blueGain, 1), maxGain)
+                    device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+                }
+                device.unlockForConfiguration()
+            } catch { }
         }
     }
 
     // MARK: - ズーム
-    /// 倍率ボタンは ramp で滑らかに、ピンチは ramp なしで即時に反映する。
+    /// 倍率ボタンは ramp で滑らかに、ピンチ/スライダーは ramp なしで即時に反映する。
     func setZoom(_ factor: CGFloat, ramp: Bool = true) {
         sessionQueue.async { [weak self] in
             guard let self, let device = self.captureDevice else { return }
@@ -338,9 +475,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 }
                 device.unlockForConfiguration()
                 DispatchQueue.main.async { self.zoomFactor = clamped }
-            } catch {
-                // ズーム設定に失敗しても撮影は継続できるので無視
-            }
+            } catch { }
         }
     }
 
@@ -364,13 +499,13 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
         // LUT なし & BGRA: 画素値をそのまま書き出す（最速・無変換）
         if activeLUT == nil, let data = imageDataFromPixelBuffer(buffer, isTIFF: isTIFF) {
+            updateThumbnail(from: data)
             savePhotoData(data, completion: isTIFF
                 ? "Log写真（TIFF）を保存しました（fmt \(formatCode)）"
                 : "Log写真を保存しました（fmt \(formatCode)）")
             return
         }
         // それ以外（LUT適用 / TIFF / 非BGRA形式）は色管理なしの CI レンダリング。
-        // ワーキングカラースペース null なので Log の画素値は変換されない。
         var image = CIImage(cvPixelBuffer: buffer)
         image = applyLUT(to: image)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
@@ -381,6 +516,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             setStatus("画像の変換に失敗しました（fmt \(formatCode)）")
             return
         }
+        updateThumbnail(from: data)
         savePhotoData(data, completion: isTIFF
             ? "Log写真（TIFF）を保存しました（fmt \(formatCode)）"
             : "Log写真を保存しました（fmt \(formatCode)）")
@@ -436,7 +572,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     // MARK: - 方式B: RAW撮影
     func captureRawLogPhoto() {
         guard let rawType = photoOutput.availableRawPhotoPixelFormatTypes.first else {
-            setStatus("この設定では RAW 撮影できません")
+            setStatus("RAW の準備ができていません。モードを切り替えて少し待ってください")
+            modeChanged()
             return
         }
         let settings = AVCapturePhotoSettings(
@@ -493,6 +630,20 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     }
 
     // MARK: - 保存ヘルパー
+    private func updateThumbnail(from data: Data) {
+        var image = UIImage(data: data)
+        if image == nil,
+           let source = CGImageSourceCreateWithData(data as CFData, nil),
+           let cgThumb = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+               kCGImageSourceCreateThumbnailFromImageAlways: true,
+               kCGImageSourceThumbnailMaxPixelSize: 200
+           ] as CFDictionary) {
+            image = UIImage(cgImage: cgThumb)
+        }
+        guard let image else { return }
+        DispatchQueue.main.async { self.lastThumbnail = image }
+    }
+
     private func savePhotoData(_ data: Data,
                                uniformTypeIdentifier: String? = nil,
                                completion message: String) {
@@ -517,7 +668,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     }
 }
 
-// MARK: - フレーム受信（方式A用）
+// MARK: - フレーム受信（方式A・プレビュー用）
 extension LogPhotoCamera: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
@@ -540,16 +691,20 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
             return
         }
         if photo.isRawPhoto {
-            // (1) DNG そのまま保存 (2) Log変換JPEGも保存
+            // (1) DNG そのまま保存 (2) Log変換画像も保存
             savePhotoData(data,
                           uniformTypeIdentifier: "com.adobe.raw-image",
                           completion: "DNG（RAW）を保存しました")
             if let converted = makeLogImageData(fromDNG: data) {
+                updateThumbnail(from: converted)
                 savePhotoData(converted, completion: outputFormat == .tiff
                     ? "Log変換TIFFも保存しました"
                     : "Log変換JPEGも保存しました")
+            } else {
+                updateThumbnail(from: data)
             }
         } else {
+            updateThumbnail(from: data)
             savePhotoData(data, completion: "写真を保存しました")
         }
     }
