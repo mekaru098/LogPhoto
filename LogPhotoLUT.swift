@@ -53,14 +53,19 @@ final class LUTStore {
 
     // MARK: - 内蔵LUT（コード生成・近似）
 
+    /// Apple Log（BT.2020 原色）→ Rec.709 表示用。カメラの Log フレームにも、
+    /// 方式Bで Apple Log 式で変換した画像にも同じように効く。
     static func builtinLogTo709() -> Entry {
-        let data = CubeLUT.build(dimension: 32) { r, g, b in
-            // 方式Bと同じ近似エンコードの逆変換でリニアに戻し、表示用ガンマをかける
-            func dec(_ x: Float) -> Float { (powf(2, 8 * x) - 1) / 255 }
-            func enc(_ x: Float) -> Float { powf(max(min(x, 1), 0), 1 / 2.2) }
-            return (enc(dec(r)), enc(dec(g)), enc(dec(b)))
+        let data = CubeLUT.build(dimension: 48) { r, g, b in
+            let lin2020 = (AppleLog.decode(r), AppleLog.decode(g), AppleLog.decode(b))
+            // BT.2020 リニア → BT.709 リニア
+            let r709 =  1.6605 * lin2020.0 - 0.5876 * lin2020.1 - 0.0728 * lin2020.2
+            let g709 = -0.1246 * lin2020.0 + 1.1329 * lin2020.1 - 0.0083 * lin2020.2
+            let b709 = -0.0182 * lin2020.0 - 0.1006 * lin2020.1 + 1.1187 * lin2020.2
+            func display(_ x: Float) -> Float { powf(max(min(x, 1), 0), 1 / 2.2) }
+            return (display(r709), display(g709), display(b709))
         }
-        return Entry(name: "Log→709（近似・内蔵）", dimension: 32, data: data)
+        return Entry(name: "Apple Log→709（内蔵）", dimension: 48, data: data)
     }
 
     static func builtinMono() -> Entry {
@@ -120,5 +125,70 @@ enum CubeLUT {
             }
         }
         return values.withUnsafeBufferPointer { Data(buffer: $0) }
+    }
+}
+
+/// Apple Log の OETF（Apple Log Profile White Paper の式）と、Core Image での適用。
+enum AppleLog {
+    static let R0: Float = -0.05641088
+    static let Rt: Float = 0.01
+    static let c: Float = 47.28711236
+    static let beta: Float = 0.00964052
+    static let gamma: Float = 0.08550479
+    static let delta: Float = 0.69336945
+    /// 1.0 にエンコードされるリニア値（ハイライトの上限、約 12）
+    static let maxLinear: Float = powf(2, (1 - delta) / gamma) - beta
+
+    /// シーンリニア（18% グレー = 0.18）→ Apple Log 符号値（0...1）
+    static func encode(_ x: Float) -> Float {
+        if x >= Rt { return min(gamma * log2f(x + beta) + delta, 1) }
+        if x >= R0 { return c * (x - R0) * (x - R0) }
+        return 0
+    }
+
+    /// Apple Log 符号値 → シーンリニア
+    static func decode(_ y: Float) -> Float {
+        let yt = c * (Rt - R0) * (Rt - R0)
+        if y >= yt { return powf(2, (y - delta) / gamma) - beta }
+        return sqrtf(max(y, 0) / c) + R0
+    }
+
+    /// 作業色空間（リニア sRGB）の CIImage を、BT.2020 原色の Apple Log 符号値にする。
+    /// 1.0 を超えるハイライトも Log に収めるため、1/maxLinear に縮めてから
+    /// 4乗根で階調を確保し、カラーキューブで Apple Log を引く。
+    static func encode(linearSRGB image: CIImage) -> CIImage {
+        let k = 1 / maxLinear
+        // sRGB → BT.2020（リニア）の行列に 1/maxLinear を掛けたもの
+        let base: [[Float]] = [
+            [0.6274, 0.3293, 0.0433],
+            [0.0691, 0.9195, 0.0114],
+            [0.0164, 0.0880, 0.8956],
+        ]
+        let m: [[CGFloat]] = base.map { row in row.map { CGFloat($0 * k) } }
+        var out = image
+        if let matrix = CIFilter(name: "CIColorMatrix", parameters: [
+            kCIInputImageKey: out,
+            "inputRVector": CIVector(x: m[0][0], y: m[0][1], z: m[0][2], w: 0),
+            "inputGVector": CIVector(x: m[1][0], y: m[1][1], z: m[1][2], w: 0),
+            "inputBVector": CIVector(x: m[2][0], y: m[2][1], z: m[2][2], w: 0),
+            "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+            "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+        ]), let o = matrix.outputImage { out = o }
+        if let clamp = CIFilter(name: "CIColorClamp", parameters: [
+            kCIInputImageKey: out,
+            "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1),
+        ]), let o = clamp.outputImage { out = o }
+        if let gammaFilter = CIFilter(name: "CIGammaAdjust", parameters: [
+            kCIInputImageKey: out, "inputPower": 0.25,
+        ]), let o = gammaFilter.outputImage { out = o }
+        let cube = CubeLUT.build(dimension: 96) { r, g, b in
+            func f(_ v: Float) -> Float { encode(powf(v, 4) * maxLinear) }
+            return (f(r), f(g), f(b))
+        }
+        if let cubeFilter = CIFilter(name: "CIColorCube", parameters: [
+            kCIInputImageKey: out, "inputCubeDimension": 96, "inputCubeData": cube,
+        ]), let o = cubeFilter.outputImage { out = o }
+        return out
     }
 }

@@ -1156,41 +1156,20 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     /// RAW(DNG) から Log変換画像（JPEG / TIFF）を作る。LUT 選択時は適用する。失敗時は nil。
     private func makeLogImageData(fromDNG data: Data, format: OutputFormat) -> Data? {
-        guard let rawFilter = CIRAWFilter(imageData: data, identifierHint: "dng"),
-              var image = rawFilter.outputImage else { return nil }
+        guard let rawFilter = CIRAWFilter(imageData: data, identifierHint: "dng") else { return nil }
+        // 現像側のトーンカーブを全部切り、シーンリニアで受け取る（Log はこちらで掛ける）
+        rawFilter.boostAmount = 0
+        rawFilter.boostShadowAmount = 0
+        rawFilter.localToneMapAmount = 0
+        rawFilter.extendedDynamicRangeAmount = 2 // ハイライトの階調を 1.0 超として残す
+        guard var image = rawFilter.outputImage else { return nil }
 
         // 撮影時の倍率に合わせてセンタートリミング（DNG 本体はフル画角のまま）
         if pendingRawZoom > 1.01 {
             image = centerCrop(image, factor: pendingRawZoom)
         }
 
-        // ハイライト側の情報を Log カーブに収めるため少し引いてから変換
-        if let exposure = CIFilter(name: "CIExposureAdjust",
-                                   parameters: [kCIInputImageKey: image, kCIInputEVKey: -1.0]),
-           let out = exposure.outputImage {
-            image = out
-        }
-
-        // Log カーブ（近似）: enc = log2(1 + x * 255) / 8
-        let kernelSource = """
-        kernel vec4 logEncode(sampler src) {
-            vec4 c = sample(src, samplerCoord(src));
-            vec3 lin = clamp(c.rgb, 0.0, 1.0);
-            vec3 enc = log2(1.0 + lin * 255.0) / 8.0;
-            return vec4(enc, c.a);
-        }
-        """
-        if let kernel = CIColorKernel(source: kernelSource),
-           let out = kernel.apply(extent: image.extent, arguments: [image]) {
-            image = out
-        } else if let controls = CIFilter(name: "CIColorControls",
-                                          parameters: [kCIInputImageKey: image,
-                                                       kCIInputSaturationKey: 0.6,
-                                                       kCIInputContrastKey: 0.8]),
-                  let out = controls.outputImage {
-            image = out // カーネルが使えない環境ではフラット化で代替
-        }
-
+        image = AppleLog.encode(linearSRGB: image)
         image = applyLUT(to: image)
 
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
