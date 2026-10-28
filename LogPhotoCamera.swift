@@ -1,4 +1,5 @@
 import AVFoundation
+import AudioToolbox
 import CoreImage
 import ImageIO
 import Photos
@@ -55,7 +56,10 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         var id: String { rawValue }
     }
 
-    @Published var appleLogAvailable = false
+    @Published var appleLogAvailable = false   // 現在のレンズに Log フォーマットがある
+    @Published var appleLogActive = false      // 実際に activeColorSpace == .appleLog になっている
+    @Published var activeLensName = "広角"      // 現在のレンズ名（検証表示用）
+    @Published var frameFormatCode = ""        // プレビューフレームの画素形式（例: x422）
     @Published var rawAvailable = false
     @Published var statusText = "準備中…"
     @Published var mode: CaptureMode = .logFrame
@@ -118,6 +122,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private var zoomLower: CGFloat = 1            // 表示倍率の可動範囲（sessionQueue 用の控え）
     private var zoomUpper: CGFloat = 1
     private var zoomSwitchToken = 0               // レンズ切替デバウンス用
+    private let zoomRequestLock = NSLock()
+    private var pendingZoomRequest: (factor: CGFloat, ramp: Bool, switchLensNow: Bool)?
+    private var zoomApplyScheduled = false
     private var rawSetupToken = 0                 // RAW ポーリングの無効化用
     private var rawUsesPhotoPreset = false
     private var pendingRawZoom: CGFloat = 1       // 撮影時のデバイス倍率（DNG 変換画像のトリミング用）
@@ -324,9 +331,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         if let chosen { photoOutput.maxPhotoDimensions = chosen }
     }
 
-    /// デバイスのフォーマット選択と、可動範囲の公開（sessionQueue 上で呼ぶ）。
-    /// モードに応じて Log 用 / RAW 用のフォーマットをここで一度に決める。
-    private func applyDeviceConfiguration(_ device: AVCaptureDevice) {
+    /// モードに応じて Log 用 / RAW 用のフォーマットと色空間をデバイスに設定する
+    /// （sessionQueue 上、必要なら session.beginConfiguration の中で呼ぶ）。
+    /// 戻り値: 見つかった Log フォーマットの有無。
+    @discardableResult
+    private func configureFormat(_ device: AVCaptureDevice) -> Bool {
         let targetMode = mode
         let logFormat = bestLogFormat(for: device)
         let format: AVCaptureDevice.Format?
@@ -337,7 +346,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         do {
             try device.lockForConfiguration()
             if let format {
-                device.activeFormat = format
+                if device.activeFormat != format { device.activeFormat = format }
                 if targetMode == .logFrame, format.supportedColorSpaces.contains(.appleLog) {
                     device.activeColorSpace = .appleLog
                 } else if let colorSpace = format.supportedColorSpaces
@@ -350,36 +359,63 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             if !device.isSubjectAreaChangeMonitoringEnabled {
                 device.isSubjectAreaChangeMonitoringEnabled = true
             }
-            let rangeFormat = device.activeFormat
-            let isoLo = Double(rangeFormat.minISO)
-            let isoHi = Double(rangeFormat.maxISO)
-            let ssLo = rangeFormat.minExposureDuration.seconds
-            let ssHi = min(rangeFormat.maxExposureDuration.seconds, 2.0)
-            let currentISO = Double(device.iso)
-            let currentSS = device.exposureDuration.seconds
-            DispatchQueue.main.async {
-                self.focusStatus = "AF 自動"
-                if isoHi > isoLo { self.isoRange = isoLo...isoHi }
-                if ssHi > ssLo { self.shutterRange = ssLo...ssHi }
-                self.isoValue = min(max(currentISO, isoLo), isoHi)
-                self.shutterSeconds = min(max(currentSS, ssLo), ssHi)
-            }
             device.unlockForConfiguration()
         } catch {
             setStatus("カメラ設定に失敗しました")
         }
         configuredMode = targetMode
+        return logFormat != nil
+    }
+
+    /// フォーマット設定後の後処理: 可動範囲の公開、写真サイズ、状態表示、倍率の再適用
+    /// （sessionQueue 上、session.commitConfiguration の後で呼ぶ）。
+    private func finishDeviceConfiguration(_ device: AVCaptureDevice, hasLogFormat: Bool) {
+        let rangeFormat = device.activeFormat
+        let isoLo = Double(rangeFormat.minISO)
+        let isoHi = Double(rangeFormat.maxISO)
+        let ssLo = rangeFormat.minExposureDuration.seconds
+        let ssHi = min(rangeFormat.maxExposureDuration.seconds, 2.0)
+        let currentISO = Double(device.iso)
+        let currentSS = device.exposureDuration.seconds
+        let logActive = device.activeColorSpace == .appleLog
+        let lensName = lensLabel(for: device)
+        DispatchQueue.main.async {
+            self.focusStatus = "AF 自動"
+            if isoHi > isoLo { self.isoRange = isoLo...isoHi }
+            if ssHi > ssLo { self.shutterRange = ssLo...ssHi }
+            self.isoValue = min(max(currentISO, isoLo), isoHi)
+            self.shutterSeconds = min(max(currentSS, ssLo), ssHi)
+            self.appleLogAvailable = hasLogFormat
+            self.appleLogActive = logActive
+            self.activeLensName = lensName
+        }
         applyMaxPhotoDimensions()
-        DispatchQueue.main.async { self.appleLogAvailable = logFormat != nil }
-        switch targetMode {
+        switch mode {
         case .logFrame:
-            setStatus(logFormat != nil ? "Apple Log で撮影できます"
-                                       : "この機種/レンズは Apple Log 非対応です")
+            setStatus(logActive ? "Apple Log で撮影できます（\(lensName)）"
+                                : "このレンズは Apple Log 非対応です（\(lensName)）")
         case .rawLog:
-            setStatus("RAW を準備中…")
+            setStatus("RAW を準備中…（\(lensName)）")
         }
         // 倍率はデバイス側の残り値ではなく、管理値 desiredZoom を適用する
         applyDesiredZoom(ramp: false)
+    }
+
+    /// 旧来の 1 段階版（起動時と RAW 失敗時の復帰用）。
+    private func applyDeviceConfiguration(_ device: AVCaptureDevice) {
+        session.beginConfiguration()
+        let hasLog = configureFormat(device)
+        session.commitConfiguration()
+        finishDeviceConfiguration(device, hasLogFormat: hasLog)
+    }
+
+    private func lensLabel(for device: AVCaptureDevice) -> String {
+        switch device.deviceType {
+        case .builtInUltraWideCamera: return "超広角"
+        case .builtInTelephotoCamera: return "望遠"
+        case .builtInWideAngleCamera: return "広角"
+        default: return device.isVirtualDevice ? "仮想" : "カメラ"
+        }
     }
 
     /// 現在の状態から使うべきレンズを決める。
@@ -393,28 +429,31 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     }
 
     /// 入力とフォーマットを現在の状態（レンズ・モード）に合わせる（sessionQueue 上で呼ぶ）。
+    /// レンズ切替は「入力の付け替え＋フォーマット設定」を 1 回の begin/commit にまとめ、
+    /// セッションの再構成を 1 度で済ませる（切替の体感速度）。
     private func reconcileInput() {
         guard let target = desiredDevice() else { return }
         let deviceChanged = target != captureDevice
         let formatNeedsUpdate = configuredMode != mode
-        if deviceChanged {
-            guard let newInput = try? AVCaptureDeviceInput(device: target) else { return }
-            session.beginConfiguration()
-            for input in session.inputs { session.removeInput(input) }
-            if session.canAddInput(newInput) { session.addInput(newInput) }
-            session.commitConfiguration()
-            captureDevice = target
-            applyVideoRotation()
-        }
         if deviceChanged || formatNeedsUpdate {
             rawSetupToken += 1 // 進行中の RAW ポーリングを無効化
+            var hasLog = false
+            session.beginConfiguration()
             if rawUsesPhotoPreset {
-                session.beginConfiguration()
                 session.sessionPreset = .inputPriority
-                session.commitConfiguration()
                 rawUsesPhotoPreset = false
             }
-            applyDeviceConfiguration(target)
+            if deviceChanged, let newInput = try? AVCaptureDeviceInput(device: target) {
+                for input in session.inputs { session.removeInput(input) }
+                hasLog = configureFormat(target) // 入力に加える前に設定しておく
+                if session.canAddInput(newInput) { session.addInput(newInput) }
+                captureDevice = target
+            } else {
+                hasLog = configureFormat(target)
+            }
+            session.commitConfiguration()
+            applyVideoRotation()
+            finishDeviceConfiguration(target, hasLogFormat: hasLog)
         }
         if mode == .rawLog {
             beginRawSetup()
@@ -422,6 +461,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             DispatchQueue.main.async { self.rawAvailable = false }
         }
     }
+
 
     private func photoArea(_ format: AVCaptureDevice.Format) -> Int {
         format.supportedMaxPhotoDimensions
@@ -695,24 +735,48 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     /// レンズ切替が必要なときは、スライダー/ピンチなら 0.3 秒待ってから（デバウンス）、
     /// 倍率ボタンなら即座に（switchLensNow）切り替える。
     /// 倍率ボタンは ramp で滑らかに、ピンチ/スライダーは ramp なしで即時に反映する。
+    /// ピンチ/スライダーは 1 秒に何十回も呼ばれるので、要求はまとめて（コアレス）
+    /// 最新の 1 件だけをカメラへ適用する。表示倍率は呼ばれた時点ですぐ公開して、
+    /// UI の追従がカメラ側の処理待ちにならないようにする。
     func setZoom(_ factor: CGFloat, ramp: Bool = true, switchLensNow: Bool = false) {
-        sessionQueue.async { [weak self] in
-            guard let self else { return }
-            self.desiredZoom = min(max(factor, self.zoomLower), self.zoomUpper)
-            if self.desiredDevice() != self.captureDevice {
-                self.zoomSwitchToken += 1
-                if switchLensNow {
-                    self.reconcileInput() // applyDeviceConfiguration が倍率も適用する
-                    return
-                }
-                let token = self.zoomSwitchToken
-                self.sessionQueue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                    guard let self, self.zoomSwitchToken == token else { return }
-                    self.reconcileInput()
-                }
-            }
-            self.applyDesiredZoom(ramp: ramp)
+        let clampedDisplay = min(max(factor, zoomLower), zoomUpper)
+        if Thread.isMainThread {
+            zoomFactor = clampedDisplay
+        } else {
+            DispatchQueue.main.async { self.zoomFactor = clampedDisplay }
         }
+        zoomRequestLock.lock()
+        pendingZoomRequest = (clampedDisplay, ramp, switchLensNow)
+        let alreadyScheduled = zoomApplyScheduled
+        zoomApplyScheduled = true
+        zoomRequestLock.unlock()
+        guard !alreadyScheduled else { return }
+        sessionQueue.async { [weak self] in
+            self?.drainZoomRequest()
+        }
+    }
+
+    private func drainZoomRequest() {
+        zoomRequestLock.lock()
+        let request = pendingZoomRequest
+        pendingZoomRequest = nil
+        zoomApplyScheduled = false
+        zoomRequestLock.unlock()
+        guard let request else { return }
+        desiredZoom = min(max(request.factor, zoomLower), zoomUpper)
+        if desiredDevice() != captureDevice {
+            zoomSwitchToken += 1
+            if request.switchLensNow {
+                reconcileInput() // applyDeviceConfiguration が倍率も適用する
+                return
+            }
+            let token = zoomSwitchToken
+            sessionQueue.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                guard let self, self.zoomSwitchToken == token else { return }
+                self.reconcileInput()
+            }
+        }
+        applyDesiredZoom(ramp: request.ramp)
     }
 
     /// desiredZoom を現在のデバイスへ適用する（sessionQueue 上で呼ぶ）。
@@ -735,7 +799,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             device.unlockForConfiguration()
         } catch { return }
         let display = desiredZoom
-        DispatchQueue.main.async { self.zoomFactor = display }
+        DispatchQueue.main.async {
+            if self.zoomFactor != display { self.zoomFactor = display }
+        }
     }
 
     // MARK: - AF
@@ -802,6 +868,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     // MARK: - シャッター（モードで振り分け）
     func shutter() {
+        // 純正と同じシャッター音（マナーモードでは鳴らない）
+        AudioServicesPlaySystemSound(1108)
         switch mode {
         case .logFrame: captureLogPhoto()
         case .rawLog: captureRawLogPhoto()
@@ -822,9 +890,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         if activeLUT == nil, !aspectFourThree,
            let data = imageDataFromPixelBuffer(buffer, isTIFF: isTIFF) {
             updateThumbnail(from: data)
-            savePhotoData(data, completion: isTIFF
-                ? "Log写真（TIFF）を保存しました（fmt \(formatCode)）"
-                : "Log写真を保存しました（fmt \(formatCode)）")
+            savePhotoData(data, completion: logSaveMessage(isTIFF: isTIFF, formatCode: formatCode))
             return
         }
         // それ以外（LUT適用 / TIFF / 非BGRA形式 / 4:3）は色管理なしの CI レンダリング。
@@ -832,17 +898,23 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         if aspectFourThree { image = cropToFourThree(image) }
         image = applyLUT(to: image)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        // TIFF は 16bit で書き出し、10bit の Log フレーム（x422 など）の階調を落とさない
         let data = isTIFF
-            ? rawContext.tiffRepresentation(of: image, format: .RGBA8, colorSpace: colorSpace)
+            ? rawContext.tiffRepresentation(of: image, format: .RGBA16, colorSpace: colorSpace)
             : rawContext.jpegRepresentation(of: image, colorSpace: colorSpace)
         guard let data else {
             setStatus("画像の変換に失敗しました（fmt \(formatCode)）")
             return
         }
         updateThumbnail(from: data)
-        savePhotoData(data, completion: isTIFF
-            ? "Log写真（TIFF）を保存しました（fmt \(formatCode)）"
-            : "Log写真を保存しました（fmt \(formatCode)）")
+        savePhotoData(data, completion: logSaveMessage(isTIFF: isTIFF, formatCode: formatCode))
+    }
+
+    /// 保存メッセージに「本当に Apple Log だったか」を含める（検証用）。
+    private func logSaveMessage(isTIFF: Bool, formatCode: String) -> String {
+        let kind = isTIFF ? "Log写真（TIFF 16bit）" : "Log写真"
+        let logState = appleLogActive ? "Apple Log" : "⚠︎ Log 無効"
+        return "\(kind)を保存しました（\(logState) / \(formatCode)）"
     }
 
     /// 倍率 factor へのセンタートリミング。
@@ -1050,7 +1122,11 @@ extension LogPhotoCamera: AVCaptureVideoDataOutputSampleBufferDelegate {
         if w != lastFrameWidth || h != lastFrameHeight {
             lastFrameWidth = w
             lastFrameHeight = h
-            DispatchQueue.main.async { self.previewFrameSize = CGSize(width: w, height: h) }
+            let code = fourCharCode(CVPixelBufferGetPixelFormatType(buffer))
+            DispatchQueue.main.async {
+                self.previewFrameSize = CGSize(width: w, height: h)
+                self.frameFormatCode = code
+            }
         }
     }
 }

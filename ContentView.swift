@@ -114,11 +114,6 @@ struct ContentView: View {
                     manualPanel
                 }
 
-                if showPanel {
-                    settingsPanel
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-
                 zoomControl
                     .padding(.bottom, 14)
 
@@ -143,17 +138,13 @@ struct ContentView: View {
         .onChange(of: camera.mode) { _, _ in
             camera.modeChanged()
         }
+        .sheet(isPresented: $showPanel) {
+            settingsSheet
+        }
         .onChange(of: camera.zoomFactor) { _, newValue in
             // 操作中でなければ、カメラ側の倍率にスライダー位置を合わせる
             if !isZoomEditing, chipDragStartZoom == nil, pinchStartZoom == nil {
                 zoomLogUI = log2(Double(max(newValue, 0.01)))
-            }
-        }
-        .fileImporter(isPresented: $showLUTImporter,
-                      allowedContentTypes: [UTType(filenameExtension: "cube") ?? .data],
-                      allowsMultipleSelection: false) { result in
-            if let url = try? result.get().first {
-                camera.importLUT(from: url)
             }
         }
         .fullScreenCover(isPresented: $showLastPhoto) {
@@ -186,9 +177,11 @@ struct ContentView: View {
     private var topBar: some View {
         HStack(spacing: 8) {
             if showBadges {
-                Text(camera.appleLogAvailable ? "APPLE LOG" : "LOG 非対応")
+                Text(camera.appleLogActive ? "APPLE LOG"
+                     : (camera.mode == .rawLog ? "RAW（Logは変換で付与）" : "⚠︎ LOG 無効"))
                     .font(.caption2.bold())
                     .tracking(0.6)
+                    .foregroundStyle(camera.appleLogActive || camera.mode == .rawLog ? .white : .yellow)
                     .padding(.horizontal, 9).padding(.vertical, 5)
                     .background(.ultraThinMaterial, in: Capsule())
                 if camera.mode == .rawLog {
@@ -234,6 +227,13 @@ struct ContentView: View {
                     .font(.caption2)
                 Text(camera.focusStatus)
                     .font(.caption.bold())
+                if showBadges {
+                    Text("·").font(.caption)
+                    Text(camera.activeLensName
+                         + (camera.frameFormatCode.isEmpty ? "" : " " + camera.frameFormatCode))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.8))
+                }
             }
             .foregroundStyle(.white)
             .padding(.horizontal, 10).padding(.vertical, 5)
@@ -432,9 +432,44 @@ struct ContentView: View {
         .padding(.bottom, 24)
     }
 
-    // MARK: - 設定パネル（歯車で開閉）
+    // MARK: - 設定シート（歯車で開閉。画面の下半分だけを使い、プレビューは見えたまま）
+    private var settingsSheet: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("設定")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                Spacer()
+                Button {
+                    showPanel = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 16)
+            .padding(.bottom, 6)
+            settingsPanel
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Color.black.opacity(0.001)) // 背景はシートの素材に任せる
+        .fileImporter(isPresented: $showLUTImporter,
+                      allowedContentTypes: [UTType(filenameExtension: "cube") ?? .data],
+                      allowsMultipleSelection: false) { result in
+            if let url = try? result.get().first {
+                camera.importLUT(from: url)
+            }
+        }
+        .presentationDetents([.fraction(0.42), .medium])
+        .presentationDragIndicator(.visible)
+        .presentationBackground(.ultraThinMaterial)
+        .preferredColorScheme(.dark)
+    }
+
     private var settingsPanel: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 14) {
             // マニュアル・形式・画角・LUT
             HStack(spacing: 10) {
                 Button {
@@ -535,12 +570,8 @@ struct ContentView: View {
             .pickerStyle(.segmented)
             .colorScheme(.dark)
         }
-        .padding(14)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
-        .overlay(RoundedRectangle(cornerRadius: 24)
-            .stroke(.white.opacity(0.10), lineWidth: 1))
-        .padding(.horizontal, 12)
-        .padding(.bottom, 12)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
     }
 
     /// タップAF: プレビューの fill クロップを補正して画像上の正規化座標へ変換する。
@@ -582,7 +613,7 @@ struct ContentView: View {
 
     // MARK: - マニュアルパネル
     private var manualPanel: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 2) {
             manualRow(label: "SS", value: shutterLabel(camera.shutterSeconds)) {
                 Slider(value: $shutterLog,
                        in: log2(camera.shutterRange.lowerBound)...log2(camera.shutterRange.upperBound),
@@ -615,27 +646,26 @@ struct ContentView: View {
                     }
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
-        .overlay(RoundedRectangle(cornerRadius: 20)
-            .stroke(.white.opacity(0.10), lineWidth: 1))
-        .padding(.horizontal, 12)
-        .padding(.bottom, 10)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .background(.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
     }
 
     private func manualRow<Control: View>(label: String, value: String,
                                           @ViewBuilder control: () -> Control) -> some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             Text(label)
-                .font(.caption.bold())
+                .font(.caption2.bold())
                 .foregroundStyle(.white)
-                .frame(width: 30, alignment: .leading)
+                .frame(width: 26, alignment: .leading)
             control()
+                .controlSize(.mini)
             Text(value)
-                .font(.caption.monospacedDigit().bold())
+                .font(.caption2.monospacedDigit().bold())
                 .foregroundStyle(.white)
-                .frame(width: 58, alignment: .trailing)
+                .frame(width: 50, alignment: .trailing)
         }
     }
 
