@@ -1,9 +1,10 @@
 import AVFoundation
 import CoreImage
+import ImageIO
 import Photos
 import UIKit
 
-/// Log Photo v1.1 - iPhone 16 Pro / Apple Log（第1世代）向け
+/// Log Photo v1.2 - iPhone 16 Pro / Apple Log（第1世代）向け
 ///
 /// 2つの撮影モード:
 /// - 方式A (.logFrame): Apple Log のビデオフレームをシャッター時に静止画保存（v0から継続）
@@ -11,8 +12,13 @@ import UIKit
 ///   (2) RAW を現像して Log カーブ（近似）で変換した JPEG も保存する
 ///
 /// v1.1 では撮影時の露出補正（-2EV〜+2EV）を追加。
+/// v1.2 の変更:
+/// - ズーム対応: トリプルカメラ（仮想デバイス）を使い、0.5/1/2/5 の倍率ボタンと
+///   ピンチズームでレンズ切替＋ズームができるようにした。
+/// - 方式Aの保存を修正: v1.1 までは Core Image の色管理変換経由で sRGB 化していたため
+///   Log の見た目が通常写真に寄ってしまっていた。v1.2 ではフレームの画素値を
+///   変換せずそのまま JPEG 化し、Log エンコードを保持する。
 /// 方式Bの Log 変換は Apple Log の厳密な OETF ではなく近似カーブ。
-/// 厳密な Apple Log 変換と実機での色検証は今後の課題（現在はクラウドのコンパイル確認のみ）。
 final class LogPhotoCamera: NSObject, ObservableObject {
 
     enum CaptureMode: String, CaseIterable, Identifiable {
@@ -26,6 +32,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     @Published var statusText = "準備中…"
     @Published var mode: CaptureMode = .logFrame
     @Published var exposureCompensation: Double = 0
+    @Published var zoomFactor: CGFloat = 1.0
+    @Published var zoomPresets: [CGFloat] = [1.0]
+    private var maxZoomFactor: CGFloat = 1.0
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "logphoto.session")
@@ -65,7 +74,19 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         guard !configured else { return }
         configured = true
 
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+        // ズーム用に仮想デバイス（トリプル→デュアル→広角の順で優先）。
+        // 仮想デバイスで Log フォーマットが取れない場合は広角にフォールバックする。
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInTripleCamera, .builtInDualCamera, .builtInWideAngleCamera],
+            mediaType: .video, position: .back)
+        var chosenDevice = discovery.devices.first
+        if let candidate = chosenDevice,
+           !candidate.formats.contains(where: { $0.supportedColorSpaces.contains(.appleLog) }),
+           let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+           wide.formats.contains(where: { $0.supportedColorSpaces.contains(.appleLog) }) {
+            chosenDevice = wide
+        }
+        guard let device = chosenDevice,
               let input = try? AVCaptureDeviceInput(device: device) else {
             setStatus("カメラが見つかりません")
             return
@@ -114,6 +135,17 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             } else {
                 setStatus("この機種/レンズは Apple Log 非対応です")
             }
+            // ズーム範囲とプリセット（純正風: 0.5 / 1 / 2 / 5、範囲外は除外）
+            let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 15.0)
+            let presets = [CGFloat(0.5), 1.0, 2.0, 5.0].filter {
+                $0 >= device.minAvailableVideoZoomFactor - 0.001 && $0 <= maxZoom
+            }
+            let initialZoom = device.videoZoomFactor
+            DispatchQueue.main.async {
+                self.maxZoomFactor = maxZoom
+                self.zoomPresets = presets.isEmpty ? [1.0] : presets
+                self.zoomFactor = initialZoom
+            }
             device.unlockForConfiguration()
         } catch {
             setStatus("カメラ設定に失敗しました")
@@ -134,6 +166,29 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - ズーム
+    /// 倍率ボタンは ramp で滑らかに、ピンチは ramp なしで即時に反映する。
+    func setZoom(_ factor: CGFloat, ramp: Bool = true) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else { return }
+            let upper = max(self.maxZoomFactor, device.minAvailableVideoZoomFactor)
+            let clamped = min(max(factor, device.minAvailableVideoZoomFactor), upper)
+            do {
+                try device.lockForConfiguration()
+                if ramp {
+                    device.ramp(toVideoZoomFactor: clamped, withRate: 12)
+                } else {
+                    device.cancelVideoZoomRamp()
+                    device.videoZoomFactor = clamped
+                }
+                device.unlockForConfiguration()
+                DispatchQueue.main.async { self.zoomFactor = clamped }
+            } catch {
+                // ズーム設定に失敗しても撮影は継続できるので無視
+            }
+        }
+    }
+
     // MARK: - シャッター（モードで振り分け）
     func shutter() {
         switch mode {
@@ -149,6 +204,13 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         bufferLock.unlock()
         guard let buffer else { setStatus("フレーム取得前です。少し待ってください"); return }
 
+        // Log エンコードされた画素値を色管理変換で化けさせないよう、
+        // バッファをそのまま JPEG 化する（プロファイルは sRGB を付ける）。
+        if let data = jpegDataFromPixelBuffer(buffer) {
+            savePhotoData(data, completion: "Log写真を保存しました")
+            return
+        }
+        // フォールバック: 従来の Core Image 経路
         let ciImage = CIImage(cvPixelBuffer: buffer)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         guard let data = ciContext.jpegRepresentation(of: ciImage,
@@ -157,6 +219,40 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             return
         }
         savePhotoData(data, completion: "Log写真を保存しました")
+    }
+
+    /// BGRA ピクセルバッファの画素値を変換せずに JPEG データ化する。
+    private func jpegDataFromPixelBuffer(_ pixelBuffer: CVPixelBuffer) -> Data? {
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
+            return nil
+        }
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let byteCount = bytesPerRow * height
+        let rawData = Data(bytes: base, count: byteCount)
+        guard let provider = CGDataProvider(data: rawData as CFData) else { return nil }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue
+            | CGImageAlphaInfo.premultipliedFirst.rawValue
+        guard let cgImage = CGImage(width: width, height: height,
+                                    bitsPerComponent: 8, bitsPerPixel: 32,
+                                    bytesPerRow: bytesPerRow,
+                                    space: colorSpace,
+                                    bitmapInfo: CGBitmapInfo(rawValue: bitmapInfo),
+                                    provider: provider,
+                                    decode: nil, shouldInterpolate: false,
+                                    intent: .defaultIntent) else { return nil }
+        let out = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            out, "public.jpeg" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, cgImage,
+            [kCGImageDestinationLossyCompressionQuality: 0.95] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return out as Data
     }
 
     // MARK: - 方式B: RAW撮影

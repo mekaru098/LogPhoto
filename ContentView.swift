@@ -5,6 +5,7 @@ struct ContentView: View {
     @StateObject private var camera = LogPhotoCamera()
     @State private var flash = false
     @State private var showGrid = true
+    @State private var pinchStartZoom: CGFloat? = nil
 
     var body: some View {
         ZStack {
@@ -12,6 +13,14 @@ struct ContentView: View {
 
             CameraPreviewView(session: camera.session)
                 .ignoresSafeArea()
+                .gesture(
+                    MagnificationGesture()
+                        .onChanged { scale in
+                            if pinchStartZoom == nil { pinchStartZoom = camera.zoomFactor }
+                            camera.setZoom((pinchStartZoom ?? 1.0) * scale, ramp: false)
+                        }
+                        .onEnded { _ in pinchStartZoom = nil }
+                )
 
             if showGrid {
                 RuleOfThirdsGrid()
@@ -77,6 +86,23 @@ struct ContentView: View {
                         .frame(width: 58, alignment: .trailing)
                 }
                 .padding(.horizontal, 24)
+                .padding(.bottom, 12)
+
+                // 倍率切替（純正風: 0.5 / 1 / 2 / 5、ピンチでも変更可）
+                HStack(spacing: 10) {
+                    ForEach(camera.zoomPresets, id: \.self) { preset in
+                        let isActive = abs(camera.zoomFactor - preset) < 0.06
+                        Button {
+                            camera.setZoom(preset)
+                        } label: {
+                            Text(preset == 1.0 ? "1x" : String(format: "%g", preset))
+                                .font(.caption.bold())
+                                .foregroundStyle(isActive ? .yellow : .white)
+                                .frame(width: 38, height: 38)
+                                .background(.black.opacity(0.45), in: Circle())
+                        }
+                    }
+                }
                 .padding(.bottom, 12)
 
                 // 撮影モード切替（方式A / 方式B）
