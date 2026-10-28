@@ -119,6 +119,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     /// RAW→Log 変換専用（中間結果をキャッシュせずメモリを抑える）
     private let rawConvertContext = CIContext(options: [.cacheIntermediates: false])
     private let rawConversionQueue = DispatchQueue(label: "logphoto.rawconvert", qos: .utility)
+    private var lastRawLogStats = ""  // 直近の RAW→Log 変換の符号値統計（検証表示用）
     /// 色管理変換をしないレンダリング用（Log の画素値をそのまま書き出すため）
     private let rawContext = CIContext(options: [.workingColorSpace: NSNull(),
                                                   .outputColorSpace: NSNull()])
@@ -1169,16 +1170,21 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             image = centerCrop(image, factor: pendingRawZoom)
         }
 
-        image = AppleLog.encode(linearSRGB: image)
-        image = applyLUT(to: image)
+        // CPU で Apple Log 符号化（式どおりの値になる）。統計はステータスに出して検証に使う。
+        guard let encoded = AppleLog.encodeOnCPU(linearSRGB: image, context: rawConvertContext,
+                                                 sixteenBit: format == .tiff) else { return nil }
+        lastRawLogStats = String(format: "黒 %.2f / 中央 %.2f / 白 %.2f",
+                                 encoded.black, encoded.median, encoded.white)
+        var logImage = CIImage(cgImage: encoded.image)
+        logImage = applyLUT(to: logImage)
 
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         switch format {
         case .jpeg:
-            return rawConvertContext.jpegRepresentation(of: image, colorSpace: colorSpace)
+            return rawContext.jpegRepresentation(of: logImage, colorSpace: colorSpace)
         case .tiff:
-            return rawConvertContext.tiffRepresentation(of: image, format: .RGBA16,
-                                                        colorSpace: colorSpace)
+            return rawContext.tiffRepresentation(of: logImage, format: .RGBA16,
+                                                 colorSpace: colorSpace)
         }
     }
 
@@ -1281,9 +1287,9 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
                     if let converted = self.makeLogImageData(fromDNG: data, format: format) {
                         self.markRawStage("7 変換画像の保存")
                         self.updateThumbnail(from: converted)
-                        self.savePhotoData(converted, completion: format == .tiff
-                            ? "Log変換TIFFも保存しました"
-                            : "Log変換JPEGも保存しました")
+                        self.savePhotoData(converted, completion: (format == .tiff
+                            ? "Log変換TIFFも保存しました" : "Log変換JPEGも保存しました")
+                            + "（\(self.lastRawLogStats)）")
                     } else {
                         self.setStatus("DNG は保存。Log 変換は失敗しました")
                     }

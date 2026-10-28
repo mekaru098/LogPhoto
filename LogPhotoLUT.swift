@@ -153,42 +153,80 @@ enum AppleLog {
         return sqrtf(max(y, 0) / c) + R0
     }
 
-    /// 作業色空間（リニア sRGB）の CIImage を、BT.2020 原色の Apple Log 符号値にする。
-    /// 1.0 を超えるハイライトも Log に収めるため、1/maxLinear に縮めてから
-    /// 4乗根で階調を確保し、カラーキューブで Apple Log を引く。
-    static func encode(linearSRGB image: CIImage) -> CIImage {
-        let k = 1 / maxLinear
-        // sRGB → BT.2020（リニア）の行列に 1/maxLinear を掛けたもの
-        let base: [[Float]] = [
-            [0.6274, 0.3293, 0.0433],
-            [0.0691, 0.9195, 0.0114],
-            [0.0164, 0.0880, 0.8956],
-        ]
-        let m: [[CGFloat]] = base.map { row in row.map { CGFloat($0 * k) } }
-        var out = image
-        if let matrix = CIFilter(name: "CIColorMatrix", parameters: [
-            kCIInputImageKey: out,
-            "inputRVector": CIVector(x: m[0][0], y: m[0][1], z: m[0][2], w: 0),
-            "inputGVector": CIVector(x: m[1][0], y: m[1][1], z: m[1][2], w: 0),
-            "inputBVector": CIVector(x: m[2][0], y: m[2][1], z: m[2][2], w: 0),
-            "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
-            "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 0),
-        ]), let o = matrix.outputImage { out = o }
-        if let clamp = CIFilter(name: "CIColorClamp", parameters: [
-            kCIInputImageKey: out,
-            "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
-            "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1),
-        ]), let o = clamp.outputImage { out = o }
-        if let gammaFilter = CIFilter(name: "CIGammaAdjust", parameters: [
-            kCIInputImageKey: out, "inputPower": 0.25,
-        ]), let o = gammaFilter.outputImage { out = o }
-        let cube = CubeLUT.build(dimension: 96) { r, g, b in
-            func f(_ v: Float) -> Float { encode(powf(v, 4) * maxLinear) }
-            return (f(r), f(g), f(b))
+    /// 符号化結果と、検証用の統計（黒 / 中央 / 白の符号値）。
+    struct Encoded {
+        let image: CGImage
+        let black: Float
+        let median: Float
+        let white: Float
+    }
+
+    /// リニア sRGB の CIImage を CPU で BT.2020 原色の Apple Log 符号値にして CGImage にする。
+    /// Core Image のフィルタ連鎖は色空間の扱いが読みにくいので、画素を float で取り出して
+    /// 式どおりに計算する（12MP で float RGBA 192MB、autoreleasepool 内で使うこと）。
+    /// sixteenBit = true なら 16bit RGB（TIFF 用）、false なら 8bit RGB（JPEG 用）。
+    static func encodeOnCPU(linearSRGB image: CIImage, context: CIContext,
+                            sixteenBit: Bool) -> Encoded? {
+        let extent = image.extent.integral
+        let width = Int(extent.width), height = Int(extent.height)
+        guard width > 0, height > 0,
+              let linearSpace = CGColorSpace(name: CGColorSpace.linearSRGB) else { return nil }
+        let count = width * height
+        var floats = [Float](repeating: 0, count: count * 4)
+        floats.withUnsafeMutableBytes { raw in
+            context.render(image, toBitmap: raw.baseAddress!, rowBytes: width * 16,
+                           bounds: extent, format: .RGBAf, colorSpace: linearSpace)
         }
-        if let cubeFilter = CIFilter(name: "CIColorCube", parameters: [
-            kCIInputImageKey: out, "inputCubeDimension": 96, "inputCubeData": cube,
-        ]), let o = cubeFilter.outputImage { out = o }
-        return out
+        // sRGB → BT.2020（リニア）
+        let m: [Float] = [0.6274, 0.3293, 0.0433,
+                          0.0691, 0.9195, 0.0114,
+                          0.0164, 0.0880, 0.8956]
+        let bytesPerPixel = sixteenBit ? 6 : 3
+        var out = [UInt8](repeating: 0, count: count * bytesPerPixel)
+        // 統計用: 輝度の符号値をサンプリング
+        var samples: [Float] = []
+        samples.reserveCapacity(count / 64 + 1)
+        floats.withUnsafeBufferPointer { src in
+            out.withUnsafeMutableBufferPointer { dst in
+                for i in 0..<count {
+                    let r = src[i * 4], g = src[i * 4 + 1], b = src[i * 4 + 2]
+                    let r2 = m[0] * r + m[1] * g + m[2] * b
+                    let g2 = m[3] * r + m[4] * g + m[5] * b
+                    let b2 = m[6] * r + m[7] * g + m[8] * b
+                    let er = encode(r2), eg = encode(g2), eb = encode(b2)
+                    if i % 64 == 0 { samples.append(0.2627 * er + 0.6780 * eg + 0.0593 * eb) }
+                    if sixteenBit {
+                        let o = i * 6
+                        let vr = UInt16(er * 65535 + 0.5), vg = UInt16(eg * 65535 + 0.5), vb = UInt16(eb * 65535 + 0.5)
+                        dst[o] = UInt8(vr >> 8); dst[o + 1] = UInt8(vr & 0xff)
+                        dst[o + 2] = UInt8(vg >> 8); dst[o + 3] = UInt8(vg & 0xff)
+                        dst[o + 4] = UInt8(vb >> 8); dst[o + 5] = UInt8(vb & 0xff)
+                    } else {
+                        let o = i * 3
+                        dst[o] = UInt8(er * 255 + 0.5)
+                        dst[o + 1] = UInt8(eg * 255 + 0.5)
+                        dst[o + 2] = UInt8(eb * 255 + 0.5)
+                    }
+                }
+            }
+        }
+        floats = []
+        samples.sort()
+        let black = samples.isEmpty ? 0 : samples[samples.count / 100]
+        let median = samples.isEmpty ? 0 : samples[samples.count / 2]
+        let white = samples.isEmpty ? 0 : samples[samples.count * 99 / 100]
+        let data = Data(out)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let cg = CGImage(width: width, height: height,
+                               bitsPerComponent: sixteenBit ? 16 : 8,
+                               bitsPerPixel: sixteenBit ? 48 : 24,
+                               bytesPerRow: width * bytesPerPixel,
+                               space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                               bitmapInfo: CGBitmapInfo(rawValue: sixteenBit
+                                   ? (CGImageAlphaInfo.none.rawValue | CGBitmapInfo.byteOrder16Big.rawValue)
+                                   : CGImageAlphaInfo.none.rawValue),
+                               provider: provider, decode: nil, shouldInterpolate: false,
+                               intent: .defaultIntent) else { return nil }
+        return Encoded(image: cg, black: black, median: median, white: white)
     }
 }
