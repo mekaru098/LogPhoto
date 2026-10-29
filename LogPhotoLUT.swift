@@ -66,7 +66,7 @@ final class LUTStore {
             func display(_ x: Float) -> Float { powf(max(min(x, 1), 0), 1 / 2.2) }
             return (display(r709), display(g709), display(b709))
         }
-        return Entry(name: "Apple Log→709（内蔵）", dimension: 48, data: data)
+        return Entry(name: "Apple Log→709", dimension: 48, data: data)
     }
 
     static func builtinMono() -> Entry {
@@ -74,7 +74,7 @@ final class LUTStore {
             let y = 0.2126 * r + 0.7152 * g + 0.0722 * b
             return (y, y, y)
         }
-        return Entry(name: "モノクロ（内蔵）", dimension: 16, data: data)
+        return Entry(name: "Mono", dimension: 16, data: data)
     }
 }
 

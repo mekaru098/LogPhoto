@@ -10,6 +10,7 @@ import UniformTypeIdentifiers
 ///   右下の歯車ボタンで開閉するパネルに集約。
 struct ContentView: View {
     @StateObject private var camera = LogPhotoCamera()
+    @ObservedObject private var language = AppLanguage.shared
     @State private var flash = false
     @State private var showGrid = true
     @State private var showBadges = true
@@ -31,6 +32,7 @@ struct ContentView: View {
     @State private var showPresetDialog = false
     @State private var presetDialogIndex: Int? = nil
     @State private var presetDialogTitle = ""
+    @State private var showAdvanced = false
 
     private var lutSelection: Binding<String> {
         Binding(get: { camera.selectedLUTName },
@@ -100,7 +102,7 @@ struct ContentView: View {
                     Button {
                         camera.lastCrashStage = nil
                     } label: {
-                        Text("前回 RAW 撮影中に終了 → 段階: \(stage)")
+                        Text(L("crash.banner", stage))
                             .font(.caption2.bold())
                             .foregroundStyle(.black)
                             .multilineTextAlignment(.leading)
@@ -149,15 +151,15 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.22), value: camera.manualMode)
         .confirmationDialog(presetDialogTitle, isPresented: $showPresetDialog, titleVisibility: .visible) {
             if let i = presetDialogIndex {
-                Button(camera.manualPresets[i] == nil ? "保存" : "上書き保存") {
+                Button(camera.manualPresets[i] == nil ? L("preset.save") : L("preset.overwrite")) {
                     camera.saveManualPreset(to: i)
                 }
                 if camera.manualPresets[i] != nil {
-                    Button("削除（空にする）", role: .destructive) {
+                    Button(L("preset.delete"), role: .destructive) {
                         camera.deleteManualPreset(at: i)
                     }
                 }
-                Button("キャンセル", role: .cancel) { }
+                Button(L("common.cancel"), role: .cancel) { }
             }
         }
         .task {
@@ -215,8 +217,9 @@ struct ContentView: View {
     private var topBar: some View {
         HStack(spacing: 8) {
             if showBadges {
-                Text(camera.appleLogActive ? "APPLE LOG"
-                     : (camera.mode == .rawLog ? "RAW（Logは変換で付与）" : "⚠︎ LOG 無効"))
+                Text(camera.appleLogActive ? L("badge.appleLog")
+                     : (camera.logUnsupportedDevice ? L("badge.logUnsupported", camera.deviceName)
+                        : (camera.mode == .rawLog ? L("badge.rawMode") : L("badge.logOff"))))
                     .font(.caption2.bold())
                     .tracking(0.6)
                     .foregroundStyle(camera.appleLogActive || camera.mode == .rawLog ? .white : .yellow)
@@ -224,7 +227,7 @@ struct ContentView: View {
                     .background(.ultraThinMaterial, in: Capsule())
                 if camera.mode == .rawLog {
                     Text(camera.rawAvailable
-                         ? String(format: "RAW %.0fMP", camera.rawMegapixels) : "RAW 準備中")
+                         ? L("badge.rawReady", camera.rawMegapixels) : L("badge.rawPreparing"))
                         .font(.caption2.bold())
                         .tracking(0.6)
                         .foregroundStyle(camera.rawAvailable ? .white : .yellow)
@@ -234,7 +237,7 @@ struct ContentView: View {
             }
             Spacer()
             if showBadges {
-                Text("iPhone 16 Pro")
+                Text(camera.deviceName)
                     .font(.caption2)
                     .padding(.horizontal, 9).padding(.vertical, 5)
                     .background(.ultraThinMaterial, in: Capsule())
@@ -268,8 +271,16 @@ struct ContentView: View {
         HStack {
             Spacer()
             HStack(spacing: 6) {
-                Text(zoomLabel(camera.zoomFactor))
-                    .font(.caption.monospacedDigit().bold())
+                if camera.lensSelectionMode == .manual, let opt = selectedLensOption {
+                    Text("\(opt.focalMM)mm · \(zoomLabel(camera.zoomFactor / opt.baseZoom))")
+                        .font(.caption.monospacedDigit().bold())
+                    Text("(" + L("lens.equiv", Double(camera.zoomFactor)) + ")")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.8))
+                } else {
+                    Text(zoomLabel(camera.zoomFactor))
+                        .font(.caption.monospacedDigit().bold())
+                }
                 Text("·")
                     .font(.caption)
                 Image(systemName: "crosshair")
@@ -301,7 +312,11 @@ struct ContentView: View {
                 zoomSliderBar
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            zoomChips
+            if camera.lensSelectionMode == .manual {
+                lensChips
+            } else {
+                zoomChips
+            }
         }
         .padding(.horizontal, 24)
         .animation(.easeInOut(duration: 0.18), value: zoomSliderVisible)
@@ -311,6 +326,44 @@ struct ContentView: View {
     private var activePreset: CGFloat? {
         let presets = camera.zoomPresets
         return presets.last(where: { $0 <= camera.zoomFactor + 0.001 }) ?? presets.first
+    }
+
+    private var selectedLensOption: LogPhotoCamera.LensOption? {
+        camera.lensOptions.first(where: { $0.id == camera.selectedLensID })
+    }
+
+    /// マニュアル方式のレンズ枠（13mm / 24mm / 48mm / 120mm …）。単眼機は 1 枠だけ。
+    private var lensChips: some View {
+        HStack(spacing: 6) {
+            ForEach(camera.lensOptions) { opt in
+                let isActive = camera.selectedLensID == opt.id
+                Button {
+                    if isActive {
+                        if zoomSliderVisible {
+                            zoomHideTask?.cancel()
+                            withAnimation(.easeInOut(duration: 0.18)) { zoomSliderVisible = false }
+                        } else {
+                            revealZoomSlider()
+                            scheduleZoomSliderHide(after: 4)
+                        }
+                        return
+                    }
+                    camera.selectLens(opt.id)
+                    zoomLogUI = log2(Double(opt.baseZoom))
+                } label: {
+                    Text("\(opt.focalMM)mm")
+                        .font(.system(size: isActive ? 12 : 11, weight: .bold).monospacedDigit())
+                        .foregroundStyle(isActive ? .yellow : .white)
+                        .frame(minWidth: 44)
+                        .frame(height: 34)
+                        .padding(.horizontal, 6)
+                        .background(isActive ? Color.black.opacity(0.6) : Color.black.opacity(0.3),
+                                    in: Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(4)
     }
 
     private var zoomChips: some View {
@@ -399,8 +452,9 @@ struct ContentView: View {
         .padding(.horizontal, 14).padding(.vertical, 5)
         .background(.black.opacity(0.45), in: Capsule())
         .simultaneousGesture(TapGesture(count: 2).onEnded {
-            camera.setZoom(1.0, ramp: true, switchLensNow: true)
-            zoomLogUI = 0
+            let base = camera.lensSelectionMode == .manual ? (selectedLensOption?.baseZoom ?? 1) : 1
+            camera.setZoom(base, ramp: true, switchLensNow: true)
+            zoomLogUI = log2(Double(base))
         })
     }
 
@@ -500,7 +554,7 @@ struct ContentView: View {
     private var settingsSheet: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("設定")
+                Text(L("settings.title"))
                     .font(.headline)
                     .foregroundStyle(.white)
                 Spacer()
@@ -542,7 +596,7 @@ struct ContentView: View {
                 } label: {
                     HStack(spacing: 5) {
                         Image(systemName: "slider.horizontal.3")
-                        Text("マニュアル")
+                        Text(L("settings.manual"))
                     }
                     .font(.caption.bold())
                     .foregroundStyle(camera.manualMode ? .black : .white)
@@ -551,7 +605,7 @@ struct ContentView: View {
                                 in: Capsule())
                 }
 
-                Picker("形式", selection: $camera.outputFormat) {
+                Picker(L("settings.format"), selection: $camera.outputFormat) {
                     ForEach(LogPhotoCamera.OutputFormat.allCases) { format in
                         Text(format.rawValue).tag(format)
                     }
@@ -563,7 +617,7 @@ struct ContentView: View {
                 Button {
                     camera.setAspectFourThree(!camera.aspectFourThree)
                 } label: {
-                    Text(camera.aspectFourThree ? "4:3" : "フル")
+                    Text(camera.aspectFourThree ? "4:3" : L("settings.aspectFull"))
                         .font(.caption.bold())
                         .foregroundStyle(.white)
                         .padding(.horizontal, 9).padding(.vertical, 7)
@@ -572,7 +626,7 @@ struct ContentView: View {
 
                 Picker("LUT", selection: lutSelection) {
                     ForEach(camera.lutNames, id: \.self) { name in
-                        Text(name).tag(name)
+                        Text(name == "なし" ? L("lut.none") : name).tag(name)
                     }
                 }
                 .pickerStyle(.menu)
@@ -582,7 +636,7 @@ struct ContentView: View {
                 Button {
                     camera.setBakeLUT(!camera.bakeLUTIntoFiles)
                 } label: {
-                    Text(camera.bakeLUTIntoFiles ? "保存にも" : "表示のみ")
+                    Text(camera.bakeLUTIntoFiles ? L("settings.lutBake") : L("settings.lutPreviewOnly"))
                         .font(.caption2.bold())
                         .foregroundStyle(camera.bakeLUTIntoFiles ? .black : .white)
                         .padding(.horizontal, 7).padding(.vertical, 6)
@@ -614,7 +668,7 @@ struct ContentView: View {
                 Button {
                     camera.setMacroMode(!camera.macroMode)
                 } label: {
-                    Text("マクロ")
+                    Text(L("settings.macro"))
                         .font(.caption.bold())
                         .foregroundStyle(camera.macroMode ? .black : .white)
                         .padding(.horizontal, 10).padding(.vertical, 7)
@@ -622,7 +676,7 @@ struct ContentView: View {
                                     in: Capsule())
                 }
 
-                Text("露出")
+                Text(L("settings.exposure"))
                     .font(.caption.bold())
                     .foregroundStyle(.white)
 
@@ -645,7 +699,7 @@ struct ContentView: View {
             } label: {
                 HStack(spacing: 5) {
                     Image(systemName: "arrow.counterclockwise")
-                    Text("スライダーをすべて初期値に戻す（各行はダブルタップでも戻せる）")
+                    Text(L("settings.resetAll"))
                 }
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.85))
@@ -653,13 +707,20 @@ struct ContentView: View {
 
             // 撮影モード切替（方式A / 方式B）と RAW の解像度
             HStack(spacing: 10) {
-                Picker("撮影モード", selection: $camera.mode) {
-                    ForEach(LogPhotoCamera.CaptureMode.allCases) { mode in
-                        Text(mode.rawValue).tag(mode)
+                if camera.logUnsupportedDevice {
+                    Text(L("settings.logUnavailable"))
+                        .font(.caption2)
+                        .foregroundStyle(.yellow)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Picker(L("settings.captureMode"), selection: $camera.mode) {
+                        ForEach(LogPhotoCamera.CaptureMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
                     }
+                    .pickerStyle(.segmented)
+                    .colorScheme(.dark)
                 }
-                .pickerStyle(.segmented)
-                .colorScheme(.dark)
 
                 Button {
                     camera.setRawHighResolution(!camera.rawHighResolution)
@@ -674,6 +735,44 @@ struct ContentView: View {
                 .opacity(camera.mode == .rawLog ? 1 : 0.4)
                 .disabled(camera.mode != .rawLog)
             }
+
+            // レンズ切替方式（オート / マニュアル）
+            HStack(spacing: 10) {
+                Text(L("settings.lensMode"))
+                    .font(.caption.bold())
+                    .foregroundStyle(.white)
+                Picker(L("settings.lensMode"), selection: Binding(
+                    get: { camera.lensSelectionMode },
+                    set: { camera.setLensSelectionMode($0) })) {
+                    Text(L("settings.lensAuto")).tag(LogPhotoCamera.LensSelectionMode.auto)
+                    Text(L("settings.lensManual")).tag(LogPhotoCamera.LensSelectionMode.manual)
+                }
+                .pickerStyle(.segmented)
+                .colorScheme(.dark)
+            }
+
+            // 詳細設定（言語）
+            DisclosureGroup(isExpanded: $showAdvanced) {
+                HStack(spacing: 10) {
+                    Text(L("settings.language"))
+                        .font(.caption.bold())
+                        .foregroundStyle(.white)
+                    Picker(L("settings.language"), selection: $language.lang) {
+                        ForEach(AppLanguage.Lang.allCases) { l in
+                            Text(l.displayName).tag(l)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .tint(.white)
+                    Spacer()
+                }
+                .padding(.top, 4)
+            } label: {
+                Text(L("settings.advanced"))
+                    .font(.caption.bold())
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+            .tint(.white)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 10)
@@ -683,9 +782,18 @@ struct ContentView: View {
     /// 残りの下側（黒）に倍率チップとシャッターを置く（純正カメラと同じ配置）。
     private func previewRect(in size: CGSize, safeTop: CGFloat) -> CGRect {
         guard camera.aspectFourThree else { return CGRect(origin: .zero, size: size) }
-        let height = min(size.width * 4 / 3, size.height)
-        let top = min(safeTop + 96, max(size.height - height - 230, 0))
-        return CGRect(x: 0, y: top, width: size.width, height: height)
+        // 上の黒い領域（バッジ列＋読み出しの 2 行）の下から始め、下は操作系の分（約 150pt）を空ける。
+        // 高さが足りなければ 4:3 を保ったまま幅を縮めて中央に置く
+        let top = safeTop + 92
+        let available = max(size.height - top - 150, 100)
+        var height = min(size.width * 4 / 3, available)
+        var width = size.width
+        if height < size.width * 4 / 3 {
+            width = height * 3 / 4
+        } else {
+            height = width * 4 / 3
+        }
+        return CGRect(x: (size.width - width) / 2, y: top, width: width, height: height)
     }
 
     /// タップAF: プレビューの fill クロップを補正して画像上の正規化座標へ変換する。
@@ -745,7 +853,7 @@ struct ContentView: View {
     /// プリセット 5 枠: タップで呼び出し、長押しで保存 / 上書き / 削除
     private var presetRow: some View {
         HStack(spacing: 6) {
-            Text("プリセット")
+            Text(L("preset.label"))
                 .font(.caption2.bold())
                 .foregroundStyle(.white.opacity(0.85))
             ForEach(0..<5, id: \.self) { i in
@@ -762,7 +870,7 @@ struct ContentView: View {
                            onLongPress: { openPresetDialog(i) })
             }
             Spacer()
-            Text("長押しで保存")
+            Text(L("preset.hint"))
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.5))
         }
@@ -801,7 +909,7 @@ struct ContentView: View {
     }
 
     private var focusRow: some View {
-        manualRow(label: "焦点", value: focusLabel(camera.focusPosition),
+        manualRow(label: L("manual.focus"), value: focusLabel(camera.focusPosition),
                   onReset: { camera.focusPosition = 0.5 }) {
             Slider(value: $camera.focusPosition, in: 0...1, step: 0.01)
                 .tint(.white)
@@ -831,8 +939,8 @@ struct ContentView: View {
     private func openPresetDialog(_ index: Int) {
         presetDialogIndex = index
         presetDialogTitle = camera.manualPresets[index] == nil
-            ? "プリセット \(index + 1) に現在の設定を保存しますか？"
-            : "プリセット \(index + 1) は保存済みです。上書きしますか？"
+            ? L("preset.askSave", index + 1)
+            : L("preset.askOverwrite", index + 1)
         showPresetDialog = true
     }
 
@@ -872,8 +980,8 @@ struct ContentView: View {
     }
 
     private func focusLabel(_ position: Double) -> String {
-        if position < 0.05 { return "最短" }
-        if position > 0.95 { return "無限遠" }
+        if position < 0.05 { return L("manual.nearest") }
+        if position > 0.95 { return L("manual.infinity") }
         return String(format: "%.2f", position)
     }
 }

@@ -45,9 +45,10 @@ import UIKit
 final class LogPhotoCamera: NSObject, ObservableObject {
 
     enum CaptureMode: String, CaseIterable, Identifiable {
-        case logFrame = "Logフレーム"
-        case rawLog = "RAW+Log"
+        case logFrame = "logFrame"
+        case rawLog = "rawLog"
         var id: String { rawValue }
+        var title: String { self == .logFrame ? L("mode.logFrame") : L("mode.rawLog") }
     }
 
     enum OutputFormat: String, CaseIterable, Identifiable {
@@ -58,18 +59,39 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     @Published var appleLogAvailable = false   // 現在のレンズに Log フォーマットがある
     @Published var appleLogActive = false      // 実際に activeColorSpace == .appleLog になっている
-    @Published var activeLensName = "広角"      // 現在のレンズ名（検証表示用）
+    @Published var activeLensName = L("lens.wide")      // 現在のレンズ名（検証表示用）
     @Published var frameFormatCode = ""        // プレビューフレームの画素形式（例: x422）
     @Published var rawAvailable = false
     /// RAW を 48MP（センサーの最大）で撮る。OFF は 12MP。
     @Published var rawHighResolution: Bool = UserDefaults.standard.bool(forKey: "logphoto.raw48")
     @Published var rawMegapixels: Double = 0   // 現在の写真サイズ（検証表示用）
-    @Published var statusText = "準備中…"
+    @Published var statusText = L("status.preparing")
     @Published var mode: CaptureMode = .logFrame
     /// 表示倍率（レンズ基準: 広角 = 1x）。管理値 desiredZoom をそのまま公開する。
     @Published var zoomFactor: CGFloat = 1.0
     @Published var zoomPresets: [CGFloat] = [1.0]
     @Published var zoomRange: ClosedRange<CGFloat> = 1.0...1.0
+
+    // --- レンズ切替方式（オート: 倍率でレンズが自動で変わる / マニュアル: レンズを固定して中でズーム）---
+    enum LensSelectionMode: String { case auto, manual }
+    struct LensOption: Identifiable, Equatable {
+        let id: String          // "uw" / "wide" / "wide2x" / "tele"
+        let focalMM: Int        // 35mm 換算の焦点距離表示（13 / 24 / 48 / 120 など）
+        let deviceID: String    // 使う実カメラの uniqueID
+        let baseZoom: CGFloat   // このレンズの 1x にあたる表示倍率（0.5 / 1 / 2 / 5）
+        let maxZoom: CGFloat    // このレンズで出せる最大の表示倍率
+    }
+    @Published var lensSelectionMode: LensSelectionMode =
+        LensSelectionMode(rawValue: UserDefaults.standard.string(forKey: "logphoto.lensMode") ?? "auto") ?? .auto
+    @Published var lensOptions: [LensOption] = []
+    @Published var selectedLensID: String? = UserDefaults.standard.string(forKey: "logphoto.lensID")
+    /// この機種に Apple Log 対応レンズが 1 本もない（15 Pro より前）
+    @Published var logUnsupportedDevice = false
+    let deviceName = DeviceModel.name
+    private var autoZoomLower: CGFloat = 1
+    private var autoZoomUpper: CGFloat = 1
+    private var lensOptionsStore: [LensOption] = []   // sessionQueue 用の控え
+    private var selectedLensStore: String? = UserDefaults.standard.string(forKey: "logphoto.lensID")
     @Published var lastThumbnail: UIImage?
 
     // 保存形式・画角・LUT
@@ -116,7 +138,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         // 前回の RAW 撮影が完了マークなしで終わっていれば、落ちた段階を表示する
         if let stage = UserDefaults.standard.string(forKey: "logphoto.rawStage") {
             lastCrashStage = stage
-            statusText = "前回 RAW 撮影中に落ちました（段階: \(stage)）"
+            statusText = L("status.lastCrash", stage)
             UserDefaults.standard.removeObject(forKey: "logphoto.rawStage")
         }
         NotificationCenter.default.addObserver(
@@ -170,7 +192,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private var lastFrameHeight = 0
     @Published var macroMode = false
     @Published var previewFrameSize: CGSize = .zero
-    @Published var focusStatus = "AF 自動"
+    @Published var focusStatus = L("af.auto")
 
     private let bufferLock = NSLock()
     private var latestBuffer: CVPixelBuffer?
@@ -183,7 +205,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             _ = await AVCaptureDevice.requestAccess(for: .video)
         }
         guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else {
-            await MainActor.run { statusText = "カメラの許可が必要です（設定アプリ）" }
+            await MainActor.run { statusText = L("status.needPermission") }
             return
         }
         sessionQueue.async { [weak self] in
@@ -213,10 +235,19 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         teleDevice = AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back)
         computeLensScales()
         publishZoomBounds()
+        // この機種に Log 対応レンズが無ければ RAW+Log だけにする
+        let anyLog = lensDevices().contains { bestLogFormat(for: $0) != nil }
+        if !anyLog {
+            DispatchQueue.main.async {
+                self.logUnsupportedDevice = true
+                self.mode = .rawLog
+            }
+            mode = .rawLog
+        }
 
         guard let device = desiredDevice(),
               let input = try? AVCaptureDeviceInput(device: device) else {
-            setStatus("カメラが見つかりません")
+            setStatus(L("status.noCamera"))
             return
         }
         captureDevice = device
@@ -340,13 +371,104 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             presets.append(5)
         }
         presets = presets.filter { $0 >= lower - 0.001 && $0 <= upper + 0.001 }
+        autoZoomLower = lower
+        autoZoomUpper = upper
+
+        // マニュアル用のレンズ枠（機種のレンズ構成から生成。48mm は 24mm の 2x クロップを独立枠に）
+        var options: [LensOption] = []
+        func lensMax(_ lens: AVCaptureDevice) -> CGFloat {
+            let format = bestLogFormat(for: lens) ?? lens.activeFormat
+            return min(min(format.videoMaxZoomFactor, 15) * zoomScale(for: lens), 15)
+        }
+        if let uw = ultraWideDevice {
+            options.append(LensOption(id: "uw", focalMM: 13, deviceID: uw.uniqueID,
+                                      baseZoom: zoomScale(for: uw), maxZoom: lensMax(uw)))
+        }
+        if let wide = wideDevice {
+            let wmax = lensMax(wide)
+            options.append(LensOption(id: "wide", focalMM: 24, deviceID: wide.uniqueID, baseZoom: 1, maxZoom: wmax))
+            if wmax >= 2 {
+                options.append(LensOption(id: "wide2x", focalMM: 48, deviceID: wide.uniqueID, baseZoom: 2, maxZoom: wmax))
+            }
+        }
+        if let tele = teleDevice {
+            let ts = zoomScale(for: tele)
+            options.append(LensOption(id: "tele", focalMM: Int((24 * ts).rounded()), deviceID: tele.uniqueID,
+                                      baseZoom: ts, maxZoom: max(lensMax(tele), ts)))
+        }
+        if options.isEmpty, let v = virtualDevice ?? captureDevice {
+            options.append(LensOption(id: "wide", focalMM: 24, deviceID: v.uniqueID, baseZoom: 1, maxZoom: lensMax(v)))
+        }
+        let opts = options
+        lensOptionsStore = opts
+        if selectedLensStore == nil || !opts.contains(where: { $0.id == selectedLensStore }) {
+            selectedLensStore = opts.first(where: { $0.id == "wide" })?.id ?? opts.first?.id
+        }
+        let selected = selectedLensStore
+        DispatchQueue.main.async {
+            self.lensOptions = opts
+            self.selectedLensID = selected
+            self.zoomPresets = presets.isEmpty ? [1.0] : presets
+        }
+        applyZoomBoundsForMode()
+    }
+
+    /// 現在のレンズ切替方式に応じて、倍率の可動範囲を決めて公開する（sessionQueue 上）。
+    private func applyZoomBoundsForMode() {
+        var lower = autoZoomLower, upper = autoZoomUpper
+        if lensSelectionMode == .manual, let opt = currentLensOption() {
+            lower = opt.baseZoom
+            upper = max(opt.maxZoom, opt.baseZoom)
+        }
         zoomLower = lower
         zoomUpper = upper
         desiredZoom = min(max(desiredZoom, lower), upper)
         let range = lower...upper
+        let display = desiredZoom
         DispatchQueue.main.async {
             self.zoomRange = range
-            self.zoomPresets = presets.isEmpty ? [1.0] : presets
+            self.zoomFactor = display
+        }
+    }
+
+    private func currentLensOption() -> LensOption? {
+        lensOptionsStore.first(where: { $0.id == selectedLensStore })
+    }
+
+    private func device(forLensOption opt: LensOption) -> AVCaptureDevice? {
+        [ultraWideDevice, wideDevice, teleDevice, virtualDevice].compactMap { $0 }
+            .first(where: { $0.uniqueID == opt.deviceID })
+    }
+
+    /// レンズ切替方式の変更（設定から）。
+    func setLensSelectionMode(_ mode: LensSelectionMode) {
+        lensSelectionMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "logphoto.lensMode")
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.teleTooClose = false
+            if mode == .manual, let opt = self.currentLensOption() {
+                self.desiredZoom = opt.baseZoom
+            }
+            self.applyZoomBoundsForMode()
+            self.reconcileInput()
+            self.applyDesiredZoom(ramp: false)
+        }
+    }
+
+    /// マニュアル方式でレンズを選ぶ。選んだレンズの 1x から始める。
+    func selectLens(_ id: String) {
+        selectedLensID = id
+        UserDefaults.standard.set(id, forKey: "logphoto.lensID")
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.selectedLensStore = id
+            guard let opt = self.currentLensOption() else { return }
+            self.teleTooClose = false
+            self.desiredZoom = opt.baseZoom
+            self.applyZoomBoundsForMode()
+            self.reconcileInput()
+            self.applyDesiredZoom(ramp: false)
         }
     }
 
@@ -418,7 +540,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             }
             device.unlockForConfiguration()
         } catch {
-            setStatus("カメラ設定に失敗しました")
+            setStatus(L("status.configFailed"))
         }
         configuredMode = targetMode
         return logFormat != nil
@@ -455,12 +577,12 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         installFocusObservation(for: device)
         scheduleTelephotoNearCheck(for: device)
         let lensName = lensLabel(for: device)
-            + (teleTooClose && device.deviceType == .builtInWideAngleCamera ? "（近距離クロップ）" : "")
+            + (teleTooClose && device.deviceType == .builtInWideAngleCamera ? L("lens.nearCrop") : "")
         let biasLo = Double(device.minExposureTargetBias)
         let biasHi = Double(device.maxExposureTargetBias)
         reapplyExposureBias(device)
         DispatchQueue.main.async {
-            self.focusStatus = keepManual ? "MF" : "AF 自動"
+            self.focusStatus = keepManual ? L("af.manual") : L("af.auto")
             if isoHi > isoLo { self.isoRange = isoLo...isoHi }
             if ssHi > ssLo { self.shutterRange = ssLo...ssHi }
             if biasHi > biasLo { self.exposureRange = biasLo...biasHi }
@@ -473,10 +595,10 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         applyMaxPhotoDimensions()
         switch mode {
         case .logFrame:
-            setStatus(logActive ? "Apple Log で撮影できます（\(lensName)）"
-                                : "このレンズは Apple Log 非対応です（\(lensName)）")
+            setStatus(logActive ? L("status.logReady", lensName)
+                                : L("status.logUnsupportedLens", lensName))
         case .rawLog:
-            setStatus("RAW を準備中…（\(lensName)）")
+            setStatus(L("status.rawPreparing", lensName))
         }
         // 倍率はデバイス側の残り値ではなく、管理値 desiredZoom を適用する
         applyDesiredZoom(ramp: false)
@@ -492,10 +614,10 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     private func lensLabel(for device: AVCaptureDevice) -> String {
         switch device.deviceType {
-        case .builtInUltraWideCamera: return "超広角"
-        case .builtInTelephotoCamera: return "望遠"
-        case .builtInWideAngleCamera: return "広角"
-        default: return device.isVirtualDevice ? "仮想" : "カメラ"
+        case .builtInUltraWideCamera: return L("lens.ultraWide")
+        case .builtInTelephotoCamera: return L("lens.tele")
+        case .builtInWideAngleCamera: return L("lens.wide")
+        default: return device.isVirtualDevice ? L("lens.virtual") : L("lens.camera")
         }
     }
 
@@ -504,6 +626,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     /// RAW・マニュアルも同じ実カメラ上で動く（仮想デバイスは実カメラがないときだけ）。
     private func desiredDevice() -> AVCaptureDevice? {
         if macroMode, let uw = ultraWideDevice { return uw }
+        if lensSelectionMode == .manual, let opt = currentLensOption(), let dev = device(forLensOption: opt) {
+            return dev // マニュアル: ユーザーが選んだレンズを固定
+        }
         if desiredZoom < 1, let uw = ultraWideDevice { return uw }
         if let tele = teleDevice, desiredZoom >= zoomScale(for: tele), !teleTooClose { return tele }
         return wideDevice ?? virtualDevice ?? ultraWideDevice
@@ -541,9 +666,14 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         guard captureDevice == device, device.deviceType == .builtInTelephotoCamera,
               !manualMode, !teleTooClose, !device.isAdjustingFocus else { return }
         if position < 0.06 {
+            if lensSelectionMode == .manual {
+                // マニュアルではレンズを尊重し、警告だけ出す
+                setStatus(L("lens.tooCloseWarn"))
+                return
+            }
             teleTooClose = true
             teleRetryAt = Date().addingTimeInterval(5)
-            setStatus("望遠の最短距離より近いので広角のクロップに切り替えました")
+            setStatus(L("status.teleFallback"))
             reconcileInput()
         }
     }
@@ -615,7 +745,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             DispatchQueue.main.async { self.rawAvailable = true }
             // 構成変更でリセットされ得る倍率を管理値に合わせ直す
             applyDesiredZoom(ramp: false)
-            setStatus("RAW+Log の準備ができました")
+            setStatus(L("status.rawReady"))
             return
         }
         if attempt < 4 {
@@ -649,7 +779,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
         if let device = captureDevice { applyDeviceConfiguration(device) }
         DispatchQueue.main.async { self.rawAvailable = false }
-        setStatus("この構成では RAW が使えませんでした")
+        setStatus(L("status.rawUnavailable"))
     }
 
     /// モード切替時に UI から呼ばれる。
@@ -665,7 +795,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self else { return }
             self.reconcileInput()
-            if on { self.setStatus("マクロ（超広角）: 被写体に近づけます") }
+            if on { self.setStatus(L("status.macro")) }
         }
     }
 
@@ -709,9 +839,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         if let entry = lutStore.importLUT(from: url) {
             refreshLUTList()
             selectLUT(entry.name)
-            setStatus("LUT「\(entry.name)」を追加しました")
+            setStatus(L("status.lutAdded", entry.name))
         } else {
-            setStatus("その .cube は読み込めませんでした")
+            setStatus(L("status.lutInvalid"))
         }
     }
 
@@ -862,7 +992,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         manualPresets[index] = currentManualPreset()
         activePresetIndex = index
         persistPresets()
-        setStatus("プリセット \(index + 1) に保存しました")
+        setStatus(L("preset.saved", index + 1))
     }
 
     func deleteManualPreset(at index: Int) {
@@ -870,7 +1000,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         manualPresets[index] = nil
         if activePresetIndex == index { activePresetIndex = nil }
         persistPresets()
-        setStatus("プリセット \(index + 1) を削除しました")
+        setStatus(L("preset.deleted", index + 1))
     }
 
     /// スロットを呼び出してカメラに適用する（マニュアルが OFF なら ON にする）。
@@ -886,7 +1016,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         } else {
             sessionQueue.async { [weak self] in self?.applyManualSettings() }
         }
-        setStatus("プリセット \(index + 1) を呼び出しました")
+        setStatus(L("preset.loaded", index + 1))
     }
 
     /// 値を手で変えたら「呼び出し中」の強調を外す（UI から呼ぶ）。
@@ -1073,7 +1203,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 // シーンが変わったら自動へ戻すための監視
                 device.isSubjectAreaChangeMonitoringEnabled = true
                 device.unlockForConfiguration()
-                DispatchQueue.main.async { self.focusStatus = "AF（タップ位置）" }
+                DispatchQueue.main.async { self.focusStatus = L("af.tap") }
             } catch { }
         }
     }
@@ -1112,7 +1242,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 device.exposureMode = .continuousAutoExposure
             }
             device.unlockForConfiguration()
-            DispatchQueue.main.async { self.focusStatus = "AF 自動" }
+            DispatchQueue.main.async { self.focusStatus = L("af.auto") }
         } catch { }
     }
 
@@ -1149,7 +1279,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         bufferLock.lock()
         let buffer = latestBuffer
         bufferLock.unlock()
-        guard let buffer else { setStatus("フレーム取得前です。少し待ってください"); return }
+        guard let buffer else { setStatus(L("status.noFrame")); return }
 
         let formatCode = fourCharCode(CVPixelBufferGetPixelFormatType(buffer))
         let isTIFF = outputFormat == .tiff
@@ -1171,7 +1301,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             ? rawContext.tiffRepresentation(of: image, format: .RGBA16, colorSpace: colorSpace)
             : rawContext.jpegRepresentation(of: image, colorSpace: colorSpace)
         guard let data else {
-            setStatus("画像の変換に失敗しました（fmt \(formatCode)）")
+            setStatus(L("status.convertFailed", formatCode))
             return
         }
         updateThumbnail(from: data)
@@ -1180,9 +1310,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     /// 保存メッセージに「本当に Apple Log だったか」を含める（検証用）。
     private func logSaveMessage(isTIFF: Bool, formatCode: String) -> String {
-        let kind = isTIFF ? "Log写真（TIFF 16bit）" : "Log写真"
-        let logState = appleLogActive ? "Apple Log" : "⚠︎ Log 無効"
-        return "\(kind)を保存しました（\(logState) / \(formatCode)）"
+        let kind = isTIFF ? L("status.logPhotoTiff") : L("status.logPhoto")
+        let logState = appleLogActive ? "Apple Log" : L("status.logOff")
+        return L("status.logSaved", kind, logState, formatCode)
     }
 
     /// 倍率 factor へのセンタートリミング。
@@ -1275,7 +1405,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self else { return }
             guard let rawType = self.photoOutput.availableRawPhotoPixelFormatTypes.first else {
-                self.setStatus("RAW の準備ができていません。少し待ってから撮影してください")
+                self.setStatus(L("status.rawNotReady"))
                 self.reconcileInput()
                 return
             }
@@ -1305,7 +1435,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             self.markRawStage("2 capturePhoto 呼び出し（\(fmt) \(dims.width)x\(dims.height)）")
             self.photoOutput.capturePhoto(with: settings, delegate: self)
             self.markRawStage("3 撮影要求済み・結果待ち")
-            self.setStatus("RAW撮影中…")
+            self.setStatus(L("status.rawCapturing"))
         }
     }
 
@@ -1327,7 +1457,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         // CPU で Apple Log 符号化（式どおりの値になる）。統計はステータスに出して検証に使う。
         guard let encoded = AppleLog.encodeOnCPU(linearSRGB: image, context: rawConvertContext,
                                                  sixteenBit: format == .tiff) else { return nil }
-        lastRawLogStats = String(format: "黒 %.2f / 中央 %.2f / 白 %.2f",
+        lastRawLogStats = L("status.rawStats",
                                  encoded.black, encoded.median, encoded.white)
         // LUT を焼き込まないなら CGImage を直接書き出す（48MP で余計なコピーを作らない）
         guard let lut = savedLUT else {
@@ -1365,7 +1495,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                                completion message: String) {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
             guard status == .authorized || status == .limited else {
-                self?.setStatus("写真への保存が許可されていません")
+                self?.setStatus(L("status.photosDenied"))
                 return
             }
             PHPhotoLibrary.shared().performChanges {
@@ -1374,7 +1504,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 options.uniformTypeIdentifier = uniformTypeIdentifier
                 request.addResource(with: .photo, data: data, options: options)
             } completionHandler: { ok, _ in
-                self?.setStatus(ok ? message : "保存に失敗しました")
+                self?.setStatus(ok ? message : L("status.saveFailed"))
             }
         }
     }
@@ -1418,12 +1548,12 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
         markRawStage("4 結果受信")
         if let error {
             markRawStage(nil)
-            setStatus("RAW撮影に失敗しました: \(error.localizedDescription)")
+            setStatus(L("status.rawFailed", error.localizedDescription))
             return
         }
         guard let data = photo.fileDataRepresentation() else {
             markRawStage(nil)
-            setStatus("RAWデータが取得できませんでした")
+            setStatus(L("status.rawNoData"))
             return
         }
         if photo.isRawPhoto {
@@ -1431,9 +1561,9 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
             markRawStage("5 DNG 保存（\(data.count / 1_000_000)MB）")
             savePhotoData(data,
                           uniformTypeIdentifier: "com.adobe.raw-image",
-                          completion: "DNG（RAW）を保存しました")
+                          completion: L("status.dngSaved"))
             updateThumbnail(from: data)
-            setStatus("DNG を保存。Log 変換中…")
+            setStatus(L("status.dngConverting"))
             markRawStage("6 Log 変換開始（\(data.count / 1_000_000)MB）")
             // 変換は重い（CIRAWFilter）ので撮影コールバックから外し、1 回ずつ直列に行う
             let format = outputFormat
@@ -1444,10 +1574,10 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
                         self.markRawStage("7 変換画像の保存")
                         self.updateThumbnail(from: converted)
                         self.savePhotoData(converted, completion: (format == .tiff
-                            ? "Log変換TIFFも保存しました" : "Log変換JPEGも保存しました")
+                            ? L("status.logTiffSaved") : L("status.logJpegSaved"))
                             + "（\(self.lastRawLogStats)）")
                     } else {
-                        self.setStatus("DNG は保存。Log 変換は失敗しました")
+                        self.setStatus(L("status.logConvertFailed"))
                     }
                     self.markRawStage(nil)
                 }
@@ -1455,7 +1585,7 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
         } else {
             markRawStage(nil)
             updateThumbnail(from: data)
-            savePhotoData(data, completion: "写真を保存しました")
+            savePhotoData(data, completion: L("status.photoSaved"))
         }
     }
 }
