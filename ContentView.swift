@@ -727,79 +727,11 @@ struct ContentView: View {
     // MARK: - マニュアルパネル
     private var manualPanel: some View {
         VStack(spacing: 2) {
-            // プリセット 5 枠: タップで呼び出し、長押しで保存 / 上書き / 削除
-            HStack(spacing: 6) {
-                Text("プリセット")
-                    .font(.caption2.bold())
-                    .foregroundStyle(.white.opacity(0.85))
-                ForEach(0..<5, id: \.self) { i in
-                    let saved = camera.manualPresets[i] != nil
-                    let active = camera.activePresetIndex == i
-                    Text("\(i + 1)")
-                        .font(.caption.bold().monospacedDigit())
-                        .foregroundStyle(active ? .black : (saved ? .white : .white.opacity(0.4)))
-                        .frame(width: 30, height: 26)
-                        .background(active ? Color.yellow : (saved ? Color.white.opacity(0.22) : Color.white.opacity(0.08)),
-                                    in: RoundedRectangle(cornerRadius: 7))
-                        .overlay(RoundedRectangle(cornerRadius: 7)
-                            .stroke(.white.opacity(saved ? 0.5 : 0.18), lineWidth: 1))
-                        .onTapGesture {
-                            if saved { camera.loadManualPreset(at: i) } else { openPresetDialog(i) }
-                        }
-                        .onLongPressGesture(minimumDuration: 0.45) {
-                            openPresetDialog(i)
-                        }
-                }
-                Spacer()
-                Text("長押しで保存")
-                    .font(.caption2)
-                    .foregroundStyle(.white.opacity(0.5))
-            }
-            .padding(.bottom, 2)
-
-            manualRow(label: "SS", value: shutterLabel(camera.shutterSeconds), onReset: {
-                shutterLog = log2(1.0 / 60)
-            }) {
-                Slider(value: $shutterLog,
-                       in: log2(camera.shutterRange.lowerBound)...log2(camera.shutterRange.upperBound),
-                       step: 0.05)
-                    .tint(.white)
-                    .onChange(of: shutterLog) { _, newValue in
-                        camera.shutterSeconds = pow(2.0, newValue)
-                        camera.updateManualExposure()
-                        camera.manualValueEdited()
-                    }
-            }
-            manualRow(label: "ISO", value: "\(Int(camera.isoValue))", onReset: {
-                camera.isoValue = min(max(100, camera.isoRange.lowerBound), camera.isoRange.upperBound)
-            }) {
-                Slider(value: $camera.isoValue, in: camera.isoRange, step: 1)
-                    .tint(.white)
-                    .onChange(of: camera.isoValue) { _, _ in
-                        camera.updateManualExposure()
-                        camera.manualValueEdited()
-                    }
-            }
-            manualRow(label: "焦点", value: focusLabel(camera.focusPosition), onReset: {
-                camera.focusPosition = 0.5
-            }) {
-                Slider(value: $camera.focusPosition, in: 0...1, step: 0.01)
-                    .tint(.white)
-                    .onChange(of: camera.focusPosition) { _, _ in
-                        camera.updateManualFocus()
-                        camera.manualValueEdited()
-                    }
-            }
-            manualRow(label: "WB", value: "\(Int(camera.whiteBalanceKelvin))K", onReset: {
-                camera.whiteBalanceKelvin = 5200
-            }) {
-                Slider(value: $camera.whiteBalanceKelvin, in: 2500...8000, step: 50)
-                    .tint(.white)
-                    .onChange(of: camera.whiteBalanceKelvin) { _, _ in
-                        camera.updateManualWhiteBalance()
-                        camera.manualValueEdited()
-                    }
-            }
+            presetRow
+            shutterRow
+            isoRow
+            focusRow
+            whiteBalanceRow
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -808,6 +740,92 @@ struct ContentView: View {
         .background(Color.black.opacity(0.22))
         .clipShape(RoundedRectangle(cornerRadius: 22))
         .overlay(RoundedRectangle(cornerRadius: 22).stroke(.white.opacity(0.12), lineWidth: 1))
+    }
+
+    /// プリセット 5 枠: タップで呼び出し、長押しで保存 / 上書き / 削除
+    private var presetRow: some View {
+        HStack(spacing: 6) {
+            Text("プリセット")
+                .font(.caption2.bold())
+                .foregroundStyle(.white.opacity(0.85))
+            ForEach(0..<5, id: \.self) { i in
+                PresetChip(number: i + 1,
+                           saved: camera.manualPresets[i] != nil,
+                           active: camera.activePresetIndex == i,
+                           onTap: {
+                               if camera.manualPresets[i] != nil {
+                                   camera.loadManualPreset(at: i)
+                               } else {
+                                   openPresetDialog(i)
+                               }
+                           },
+                           onLongPress: { openPresetDialog(i) })
+            }
+            Spacer()
+            Text("長押しで保存")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.5))
+        }
+        .padding(.bottom, 2)
+    }
+
+    private var shutterRange: ClosedRange<Double> {
+        let lo = log2(camera.shutterRange.lowerBound)
+        let hi = log2(camera.shutterRange.upperBound)
+        return lo...max(hi, lo + 0.01)
+    }
+
+    private var shutterRow: some View {
+        manualRow(label: "SS", value: shutterLabel(camera.shutterSeconds),
+                  onReset: { shutterLog = log2(1.0 / 60) }) {
+            Slider(value: $shutterLog, in: shutterRange, step: 0.05)
+                .tint(.white)
+                .onChange(of: shutterLog) { _, newValue in
+                    camera.shutterSeconds = pow(2.0, newValue)
+                    camera.updateManualExposure()
+                    camera.manualValueEdited()
+                }
+        }
+    }
+
+    private var isoRow: some View {
+        manualRow(label: "ISO", value: "\(Int(camera.isoValue))",
+                  onReset: { camera.isoValue = defaultISO }) {
+            Slider(value: $camera.isoValue, in: camera.isoRange, step: 1)
+                .tint(.white)
+                .onChange(of: camera.isoValue) { _, _ in
+                    camera.updateManualExposure()
+                    camera.manualValueEdited()
+                }
+        }
+    }
+
+    private var focusRow: some View {
+        manualRow(label: "焦点", value: focusLabel(camera.focusPosition),
+                  onReset: { camera.focusPosition = 0.5 }) {
+            Slider(value: $camera.focusPosition, in: 0...1, step: 0.01)
+                .tint(.white)
+                .onChange(of: camera.focusPosition) { _, _ in
+                    camera.updateManualFocus()
+                    camera.manualValueEdited()
+                }
+        }
+    }
+
+    private var whiteBalanceRow: some View {
+        manualRow(label: "WB", value: "\(Int(camera.whiteBalanceKelvin))K",
+                  onReset: { camera.whiteBalanceKelvin = 5200 }) {
+            Slider(value: $camera.whiteBalanceKelvin, in: 2500...8000, step: 50)
+                .tint(.white)
+                .onChange(of: camera.whiteBalanceKelvin) { _, _ in
+                    camera.updateManualWhiteBalance()
+                    camera.manualValueEdited()
+                }
+        }
+    }
+
+    private var defaultISO: Double {
+        min(max(100, camera.isoRange.lowerBound), camera.isoRange.upperBound)
     }
 
     private func openPresetDialog(_ index: Int) {
@@ -824,7 +842,7 @@ struct ContentView: View {
         camera.setZoom(1.0, ramp: true, switchLensNow: true)
         zoomLogUI = 0
         shutterLog = log2(1.0 / 60)
-        camera.isoValue = min(max(100, camera.isoRange.lowerBound), camera.isoRange.upperBound)
+        camera.isoValue = defaultISO
         camera.focusPosition = 0.5
         camera.whiteBalanceKelvin = 5200
         camera.manualValueEdited()
@@ -857,6 +875,37 @@ struct ContentView: View {
         if position < 0.05 { return "最短" }
         if position > 0.95 { return "無限遠" }
         return String(format: "%.2f", position)
+    }
+}
+
+/// マニュアルプリセットの 1 枠。
+private struct PresetChip: View {
+    let number: Int
+    let saved: Bool
+    let active: Bool
+    let onTap: () -> Void
+    let onLongPress: () -> Void
+
+    private var textColor: Color {
+        if active { return .black }
+        return saved ? .white : .white.opacity(0.4)
+    }
+
+    private var fillColor: Color {
+        if active { return .yellow }
+        return saved ? Color.white.opacity(0.22) : Color.white.opacity(0.08)
+    }
+
+    var body: some View {
+        Text("\(number)")
+            .font(.caption.bold().monospacedDigit())
+            .foregroundStyle(textColor)
+            .frame(width: 30, height: 26)
+            .background(fillColor, in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7)
+                .stroke(.white.opacity(saved ? 0.5 : 0.18), lineWidth: 1))
+            .onTapGesture { onTap() }
+            .onLongPressGesture(minimumDuration: 0.45) { onLongPress() }
     }
 }
 
