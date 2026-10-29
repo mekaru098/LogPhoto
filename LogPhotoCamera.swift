@@ -139,11 +139,73 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         if let stage = UserDefaults.standard.string(forKey: "logphoto.rawStage") {
             lastCrashStage = stage
             statusText = L("status.lastCrash", stage)
+            dlog("crash", "前回の RAW 撮影が途中で終了: \(stage)")
             UserDefaults.standard.removeObject(forKey: "logphoto.rawStage")
         }
         NotificationCenter.default.addObserver(
             self, selector: #selector(subjectAreaDidChange(_:)),
             name: .AVCaptureDeviceSubjectAreaDidChange, object: nil)
+        // セッションの異常・中断・メモリ警告を記録する（切替でおかしくなる原因の切り分け用）
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(sessionRuntimeError(_:)),
+            name: AVCaptureSession.runtimeErrorNotification, object: session)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(sessionWasInterrupted(_:)),
+            name: AVCaptureSession.wasInterruptedNotification, object: session)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(sessionInterruptionEnded(_:)),
+            name: AVCaptureSession.interruptionEndedNotification, object: session)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(memoryWarningReceived(_:)),
+            name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+    }
+
+    // MARK: - セッション監視（ログ＋自動再開）
+    /// 直近の自動再開の時刻（sessionQueue 上でのみ使う）。短時間に繰り返すときは諦める。
+    private var restartTimes: [Date] = []
+
+    @objc private func sessionRuntimeError(_ note: Notification) {
+        let error = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
+        dlog("session", "runtimeError domain=\(error?.domain ?? "?") code=\(error?.code ?? 0) \(error?.localizedDescription ?? "")")
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.restartTimes = self.restartTimes.filter { Date().timeIntervalSince($0) < 30 }
+            guard self.restartTimes.count < 3 else {
+                dlog("session", "自動再開を断念（30秒以内に3回失敗）")
+                self.setStatus(L("status.sessionStopped"))
+                return
+            }
+            self.restartTimes.append(Date())
+            if !self.session.isRunning {
+                dlog("session", "自動再開 startRunning")
+                self.session.startRunning()
+            }
+        }
+    }
+
+    @objc private func sessionWasInterrupted(_ note: Notification) {
+        var reason = "?"
+        if let value = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int,
+           let r = AVCaptureSession.InterruptionReason(rawValue: value) {
+            reason = "\(r)(\(value))"
+        }
+        dlog("session", "wasInterrupted reason=\(reason)")
+    }
+
+    @objc private func sessionInterruptionEnded(_ note: Notification) {
+        dlog("session", "interruptionEnded running=\(session.isRunning)")
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            if !self.session.isRunning {
+                dlog("session", "中断後に停止していたため startRunning")
+                self.session.startRunning()
+            }
+        }
+    }
+
+    @objc private func memoryWarningReceived(_ note: Notification) {
+        let stage = UserDefaults.standard.string(forKey: "logphoto.rawStage") ?? "-"
+        dlog("memory", "メモリ警告 mode=\(mode.rawValue) rawStage=\(stage)")
     }
 
     deinit {
@@ -205,18 +267,25 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             _ = await AVCaptureDevice.requestAccess(for: .video)
         }
         guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else {
+            dlog("session", "カメラ権限なし status=\(AVCaptureDevice.authorizationStatus(for: .video).rawValue)")
             await MainActor.run { statusText = L("status.needPermission") }
             return
         }
         sessionQueue.async { [weak self] in
             self?.configureIfNeeded()
-            if !(self?.session.isRunning ?? true) { self?.session.startRunning() }
+            if !(self?.session.isRunning ?? true) {
+                dlog("session", "startRunning")
+                self?.session.startRunning()
+            }
         }
     }
 
     func stop() {
         sessionQueue.async { [weak self] in
-            if self?.session.isRunning == true { self?.session.stopRunning() }
+            if self?.session.isRunning == true {
+                dlog("session", "stopRunning")
+                self?.session.stopRunning()
+            }
         }
     }
 
@@ -247,10 +316,12 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
         guard let device = desiredDevice(),
               let input = try? AVCaptureDeviceInput(device: device) else {
+            dlog("session", "configure: 入力を作れない（desiredDevice が nil か AVCaptureDeviceInput 失敗）")
             setStatus(L("status.noCamera"))
             return
         }
         captureDevice = device
+        dlog("session", "configure: device=\(device.localizedName) type=\(device.deviceType.rawValue) mode=\(mode.rawValue) virtual=\(virtualDevice != nil) tele=\(teleDevice != nil) uw=\(ultraWideDevice != nil)")
 
         session.beginConfiguration()
         session.sessionPreset = .inputPriority // カスタムフォーマットを優先
@@ -442,6 +513,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     /// レンズ切替方式の変更（設定から）。
     func setLensSelectionMode(_ mode: LensSelectionMode) {
+        dlog("lens", "レンズ方式 → \(mode.rawValue)")
         lensSelectionMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: "logphoto.lensMode")
         sessionQueue.async { [weak self] in
@@ -458,6 +530,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     /// マニュアル方式でレンズを選ぶ。選んだレンズの 1x から始める。
     func selectLens(_ id: String) {
+        dlog("lens", "レンズ選択 id=\(id)")
         selectedLensID = id
         UserDefaults.standard.set(id, forKey: "logphoto.lensID")
         sessionQueue.async { [weak self] in
@@ -540,6 +613,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             }
             device.unlockForConfiguration()
         } catch {
+            dlog("lens", "configureFormat 失敗 device=\(device.localizedName) mode=\(targetMode.rawValue) \(error.localizedDescription)")
             setStatus(L("status.configFailed"))
         }
         configuredMode = targetMode
@@ -696,26 +770,47 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let deviceChanged = target != captureDevice
         let formatNeedsUpdate = configuredMode != mode
         if deviceChanged || formatNeedsUpdate {
+            dlog("lens", "reconcile: \(captureDevice?.localizedName ?? "nil") → \(target.localizedName) deviceChanged=\(deviceChanged) formatChanged=\(formatNeedsUpdate) mode=\(mode.rawValue) lensMode=\(lensSelectionMode.rawValue) running=\(session.isRunning)")
             rawSetupToken += 1 // 進行中の RAW ポーリングを無効化
             var hasLog = false
+            var activeDevice = target
+            var newInput: AVCaptureDeviceInput? = nil
+            if deviceChanged {
+                do {
+                    newInput = try AVCaptureDeviceInput(device: target)
+                } catch {
+                    dlog("lens", "入力の作成に失敗: \(target.localizedName) \(error.localizedDescription)")
+                }
+            }
             session.beginConfiguration()
             if rawUsesPhotoPreset {
                 session.sessionPreset = .inputPriority
                 rawUsesPhotoPreset = false
             }
-            if deviceChanged, let newInput = try? AVCaptureDeviceInput(device: target) {
-                for input in session.inputs { session.removeInput(input) }
-                if session.canAddInput(newInput) { session.addInput(newInput) }
-                // 入力に加えた後・commit の前にフォーマットと色空間を決める（同じトランザクション内）
-                hasLog = configureFormat(target)
-                captureDevice = target
-                ignoreFramesUntil = CACurrentMediaTime() + 0.25
+            if deviceChanged, let newInput {
+                let oldInputs = session.inputs
+                for input in oldInputs { session.removeInput(input) }
+                if session.canAddInput(newInput) {
+                    session.addInput(newInput)
+                    // 入力に加えた後・commit の前にフォーマットと色空間を決める（同じトランザクション内）
+                    hasLog = configureFormat(target)
+                    captureDevice = target
+                    ignoreFramesUntil = CACurrentMediaTime() + 0.25
+                } else {
+                    // 追加できなければ元の入力へ戻す（入力ゼロで captureDevice だけ進むのを防ぐ）
+                    dlog("lens", "canAddInput=false: \(target.localizedName)。元の入力へ戻す")
+                    for input in oldInputs where session.canAddInput(input) { session.addInput(input) }
+                    activeDevice = captureDevice ?? target
+                    hasLog = configureFormat(activeDevice)
+                }
             } else {
-                hasLog = configureFormat(target)
+                if deviceChanged { activeDevice = captureDevice ?? target }
+                hasLog = configureFormat(activeDevice)
             }
             session.commitConfiguration()
             applyVideoRotation()
-            finishDeviceConfiguration(target, hasLogFormat: hasLog)
+            finishDeviceConfiguration(activeDevice, hasLogFormat: hasLog)
+            dlog("lens", "reconcile 完了: active=\(activeDevice.localizedName) logFormat=\(hasLog) appleLog=\(activeDevice.activeColorSpace == .appleLog) running=\(session.isRunning)")
         }
         if mode == .rawLog {
             beginRawSetup()
@@ -742,6 +837,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private func pollRawTypes(attempt: Int, photoPresetStage: Bool, token: Int) {
         guard token == rawSetupToken, mode == .rawLog else { return }
         if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
+            dlog("raw", "RAW 準備OK attempt=\(attempt) photoPreset=\(photoPresetStage) device=\(captureDevice?.localizedName ?? "nil")")
             DispatchQueue.main.async { self.rawAvailable = true }
             // 構成変更でリセットされ得る倍率を管理値に合わせ直す
             applyDesiredZoom(ramp: false)
@@ -757,6 +853,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
         if !photoPresetStage {
             // 段階2: 写真優先プリセットで再構成する
+            dlog("raw", "RAW 形式が現れない → .photo プリセットで再構成 device=\(captureDevice?.localizedName ?? "nil")")
             session.beginConfiguration()
             session.sessionPreset = .photo
             session.commitConfiguration()
@@ -771,6 +868,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     }
 
     private func finishRawSetupFailure() {
+        dlog("raw", "RAW セットアップ失敗（.photo プリセットでも形式なし） device=\(captureDevice?.localizedName ?? "nil")")
         if rawUsesPhotoPreset {
             session.beginConfiguration()
             session.sessionPreset = .inputPriority
@@ -784,6 +882,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     /// モード切替時に UI から呼ばれる。
     func modeChanged() {
+        dlog("mode", "モード切替 → \(mode.rawValue)")
         sessionQueue.async { [weak self] in
             self?.reconcileInput()
         }
@@ -898,7 +997,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                               min(Double(device.maxExposureTargetBias), ev))
             device.setExposureTargetBias(Float(clamped), completionHandler: nil)
             device.unlockForConfiguration()
-        } catch { }
+        } catch { dlog("device", "reapplyExposureBias 失敗: \(error.localizedDescription)") }
     }
 
     // MARK: - マニュアル撮影（実カメラでのみ使う）
@@ -920,7 +1019,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                         device.whiteBalanceMode = .continuousAutoWhiteBalance
                     }
                     device.unlockForConfiguration()
-                } catch { }
+                } catch { dlog("device", "setManualMode 失敗: \(error.localizedDescription)") }
             }
             self.reconcileInput()
             if on {
@@ -960,7 +1059,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
             }
             device.unlockForConfiguration()
-        } catch { }
+        } catch { dlog("device", "applyManualSettings 失敗: \(error.localizedDescription)") }
     }
 
     // MARK: - マニュアルプリセット（5 枠、上書き・削除可）
@@ -1046,7 +1145,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                         iso: iso, completionHandler: nil)
                 }
                 device.unlockForConfiguration()
-            } catch { }
+            } catch { dlog("device", "updateManualExposure 失敗: \(error.localizedDescription)") }
         }
     }
 
@@ -1061,7 +1160,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                     device.setFocusModeLocked(lensPosition: position, completionHandler: nil)
                 }
                 device.unlockForConfiguration()
-            } catch { }
+            } catch { dlog("device", "updateManualFocus 失敗: \(error.localizedDescription)") }
         }
     }
 
@@ -1083,7 +1182,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                     device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
                 }
                 device.unlockForConfiguration()
-            } catch { }
+            } catch { dlog("device", "updateManualWhiteBalance 失敗: \(error.localizedDescription)") }
         }
     }
 
@@ -1166,7 +1265,10 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 if device.videoZoomFactor != deviceZoom { device.videoZoomFactor = deviceZoom }
             }
             device.unlockForConfiguration()
-        } catch { return }
+        } catch {
+            dlog("zoom", "applyDesiredZoom の lockForConfiguration 失敗: \(error.localizedDescription)")
+            return
+        }
         let display = desiredZoom
         DispatchQueue.main.async {
             if self.zoomFactor != display { self.zoomFactor = display }
@@ -1204,7 +1306,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 device.isSubjectAreaChangeMonitoringEnabled = true
                 device.unlockForConfiguration()
                 DispatchQueue.main.async { self.focusStatus = L("af.tap") }
-            } catch { }
+            } catch { dlog("device", "focusAt 失敗: \(error.localizedDescription)") }
         }
     }
 
@@ -1243,7 +1345,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             }
             device.unlockForConfiguration()
             DispatchQueue.main.async { self.focusStatus = L("af.auto") }
-        } catch { }
+        } catch { dlog("device", "resetContinuousAutoFocus 失敗: \(error.localizedDescription)") }
     }
 
     // MARK: - シャッター（モードで振り分け）
@@ -1279,7 +1381,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         bufferLock.lock()
         let buffer = latestBuffer
         bufferLock.unlock()
-        guard let buffer else { setStatus(L("status.noFrame")); return }
+        guard let buffer else {
+            dlog("capture", "Log フレーム撮影: フレームなし running=\(session.isRunning)")
+            setStatus(L("status.noFrame"))
+            return
+        }
 
         let formatCode = fourCharCode(CVPixelBufferGetPixelFormatType(buffer))
         let isTIFF = outputFormat == .tiff
@@ -1301,6 +1407,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             ? rawContext.tiffRepresentation(of: image, format: .RGBA16, colorSpace: colorSpace)
             : rawContext.jpegRepresentation(of: image, colorSpace: colorSpace)
         guard let data else {
+            dlog("capture", "Log フレーム変換失敗 format=\(formatCode) tiff=\(isTIFF)")
             setStatus(L("status.convertFailed", formatCode))
             return
         }
@@ -1405,6 +1512,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self else { return }
             guard let rawType = self.photoOutput.availableRawPhotoPixelFormatTypes.first else {
+                dlog("raw", "撮影要求したが RAW 形式なし → 再構成 device=\(self.captureDevice?.localizedName ?? "nil") running=\(self.session.isRunning)")
                 self.setStatus(L("status.rawNotReady"))
                 self.reconcileInput()
                 return
@@ -1424,6 +1532,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             let dims = self.photoOutput.maxPhotoDimensions
             let fmt = self.fourCharCode(rawType)
             self.markRawStage("1 設定作成（\(fmt) \(dims.width)x\(dims.height) preset=\(self.rawUsesPhotoPreset ? "photo" : "input")）")
+            dlog("raw", "撮影要求 fmt=\(fmt) dims=\(dims.width)x\(dims.height) device=\(self.captureDevice?.localizedName ?? "nil") zoom=\(self.captureDevice?.videoZoomFactor ?? 0) crop=\(self.previewCropFactor) preset=\(self.rawUsesPhotoPreset ? "photo" : "input") running=\(self.session.isRunning)")
             let settings = AVCapturePhotoSettings(rawPixelFormatType: rawType)
             // AVFoundation の規則: Bayer RAW では photoQualityPrioritization は .speed 必須
             // （.balanced/.quality は設定時に例外、既定の .balanced のままでも capturePhoto で例外）。
@@ -1495,6 +1604,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                                completion message: String) {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
             guard status == .authorized || status == .limited else {
+                dlog("save", "写真ライブラリの権限なし status=\(status.rawValue)")
                 self?.setStatus(L("status.photosDenied"))
                 return
             }
@@ -1503,7 +1613,13 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 let options = PHAssetResourceCreationOptions()
                 options.uniformTypeIdentifier = uniformTypeIdentifier
                 request.addResource(with: .photo, data: data, options: options)
-            } completionHandler: { ok, _ in
+            } completionHandler: { ok, error in
+                if ok {
+                    dlog("save", "保存OK size=\(data.count / 1000)KB type=\(uniformTypeIdentifier ?? "-")")
+                } else {
+                    let ns = error as NSError?
+                    dlog("save", "保存失敗 domain=\(ns?.domain ?? "?") code=\(ns?.code ?? 0) \(error?.localizedDescription ?? "")")
+                }
                 self?.setStatus(ok ? message : L("status.saveFailed"))
             }
         }
@@ -1547,15 +1663,19 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
                      error: Error?) {
         markRawStage("4 結果受信")
         if let error {
+            let ns = error as NSError
+            dlog("raw", "撮影エラー domain=\(ns.domain) code=\(ns.code) \(error.localizedDescription) device=\(captureDevice?.localizedName ?? "nil") mode=\(mode.rawValue)")
             markRawStage(nil)
             setStatus(L("status.rawFailed", error.localizedDescription))
             return
         }
         guard let data = photo.fileDataRepresentation() else {
+            dlog("raw", "結果受信したが fileDataRepresentation が nil isRaw=\(photo.isRawPhoto)")
             markRawStage(nil)
             setStatus(L("status.rawNoData"))
             return
         }
+        dlog("raw", "結果受信 isRaw=\(photo.isRawPhoto) size=\(data.count / 1000)KB device=\(captureDevice?.localizedName ?? "nil")")
         if photo.isRawPhoto {
             // (1) DNG そのまま保存 (2) Log変換画像も保存
             markRawStage("5 DNG 保存（\(data.count / 1_000_000)MB）")
@@ -1571,12 +1691,14 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
                 guard let self else { return }
                 autoreleasepool {
                     if let converted = self.makeLogImageData(fromDNG: data, format: format) {
+                        dlog("raw", "Log 変換OK size=\(converted.count / 1000)KB \(self.lastRawLogStats)")
                         self.markRawStage("7 変換画像の保存")
                         self.updateThumbnail(from: converted)
                         self.savePhotoData(converted, completion: (format == .tiff
                             ? L("status.logTiffSaved") : L("status.logJpegSaved"))
                             + "（\(self.lastRawLogStats)）")
                     } else {
+                        dlog("raw", "Log 変換に失敗（CIRAWFilter が nil か出力なし）")
                         self.setStatus(L("status.logConvertFailed"))
                     }
                     self.markRawStage(nil)

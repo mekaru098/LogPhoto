@@ -767,6 +767,24 @@ struct ContentView: View {
                     Spacer()
                 }
                 .padding(.top, 4)
+
+                // 不具合調査用ログ（共有シートで書き出し → チャットに貼って原因を探せる）
+                HStack(spacing: 14) {
+                    ShareLink(item: DebugLog.shared.fileURL) {
+                        Label(L("settings.logExport"), systemImage: "square.and.arrow.up")
+                            .font(.caption.bold())
+                    }
+                    .simultaneousGesture(TapGesture().onEnded { DebugLog.shared.flush() })
+                    Button {
+                        DebugLog.shared.clear()
+                    } label: {
+                        Label(L("settings.logClear"), systemImage: "trash")
+                            .font(.caption.bold())
+                    }
+                    Spacer()
+                }
+                .tint(.white)
+                .padding(.top, 6)
             } label: {
                 Text(L("settings.advanced"))
                     .font(.caption.bold())

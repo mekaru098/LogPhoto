@@ -59,7 +59,10 @@ enum Strings {
         "badge.rawReady": [.ja: "RAW %.0fMP", .en: "RAW %.0fMP", .zh: "RAW %.0fMP", .it: "RAW %.0fMP"],
         "badge.rawPreparing": [.ja: "RAW 準備中", .en: "RAW preparing", .zh: "RAW 准备中", .it: "RAW in preparazione"],
         "badge.logUnsupported": [.ja: "LOG 非対応（%@）", .en: "LOG not supported (%@)", .zh: "不支持 LOG（%@）", .it: "LOG non supportato (%@)"],
-        "crash.banner": [.ja: "前回 RAW 撮影中に終了 → 段階: %@", .en: "Last RAW capture ended abnormally → stage: %@", .zh: "上次 RAW 拍摄异常结束 → 阶段：%@", .it: "Ultimo scatto RAW interrotto → fase: %@"],
+        "settings.logExport": [.ja: "ログを書き出す", .en: "Export log", .zh: "导出日志", .it: "Esporta log"],
+        "settings.logClear": [.ja: "ログを消去", .en: "Clear log", .zh: "清除日志", .it: "Cancella log"],
+        "status.sessionStopped": [.ja: "カメラが停止しました。アプリを開き直してください", .en: "Camera stopped. Please reopen the app", .zh: "相机已停止，请重新打开应用", .it: "Fotocamera interrotta. Riapri l'app"],
+        "crash.banner":[.ja: "前回 RAW 撮影中に終了 → 段階: %@", .en: "Last RAW capture ended abnormally → stage: %@", .zh: "上次 RAW 拍摄异常结束 → 阶段：%@", .it: "Ultimo scatto RAW interrotto → fase: %@"],
         // --- 読み出し / AF ---
         "af.auto": [.ja: "AF 自動", .en: "AF auto", .zh: "AF 自动", .it: "AF auto"],
         "af.tap": [.ja: "AF（タップ位置）", .en: "AF (tap)", .zh: "AF（点按处）", .it: "AF (tocco)"],
