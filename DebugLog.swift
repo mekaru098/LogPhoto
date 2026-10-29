@@ -85,20 +85,22 @@ final class DebugLog {
 
     private func append(_ line: String) {
         guard let data = line.data(using: .utf8) else { return }
+        let size: Int
         do {
             let handle = try FileHandle(forWritingTo: url)
-            try handle.seekToEnd()
+            // 末尾の位置 = 書く前の大きさ。ファイル属性を読む API（App Store の申告対象）を使わずに済ませる
+            let end = try handle.seekToEnd()
             try handle.write(contentsOf: data)
             try handle.close()
+            size = Int(end) + data.count
         } catch {
             return
         }
-        trimIfNeeded()
+        trimIfNeeded(size: size)
     }
 
-    private func trimIfNeeded() {
-        guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int,
-              size > maxBytes,
+    private func trimIfNeeded(size: Int) {
+        guard size > maxBytes,
               let all = try? Data(contentsOf: url) else { return }
         var tail = Data(all.suffix(maxBytes / 2))
         if let newline = tail.firstIndex(of: 0x0A) {

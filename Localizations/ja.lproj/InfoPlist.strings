@@ -1,0 +1,3 @@
+/* 許可ダイアログの文言（端末の言語に従う。アプリ内の言語設定とは別） */
+"NSCameraUsageDescription" = "LogPhoto は Log 写真と RAW 写真を撮るためにカメラを使います。";
+"NSPhotoLibraryAddUsageDescription" = "LogPhoto は撮った写真を写真ライブラリに保存します。";

@@ -1,0 +1,3 @@
+/* Testi delle richieste di autorizzazione (lingua del dispositivo; la lingua dell'app è un'impostazione separata) */
+"NSCameraUsageDescription" = "LogPhoto usa la fotocamera per scattare foto Log e RAW.";
+"NSPhotoLibraryAddUsageDescription" = "LogPhoto salva le foto scattate nella tua libreria.";

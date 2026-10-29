@@ -1,6 +1,6 @@
 name: LogPhoto
 options:
-  bundleIdPrefix: com.example
+  bundleIdPrefix: com.hame
   deploymentTarget:
     iOS: "18.0"
 targets:
@@ -16,6 +16,8 @@ targets:
       - Localization.swift
       - DebugLog.swift
       - Assets.xcassets
+      - PrivacyInfo.xcprivacy   # App Store 提出に必要（使う API の利用理由）
+      - Localizations           # 許可ダイアログの文言（InfoPlist.strings、言語ごと）
     preBuildScripts:
       - name: Decode App Icon
         script: 'base64 -D -i "$SRCROOT/AppIcon.b64" -o "$SRCROOT/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png"'
@@ -27,11 +29,15 @@ targets:
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
-        NSCameraUsageDescription: Camera is used to capture Log photos
-        NSPhotoLibraryAddUsageDescription: Used to save captured Log photos
+        # 許可文の既定値（英語）。各言語の文言は Localizations/*.lproj/InfoPlist.strings
+        NSCameraUsageDescription: LogPhoto uses the camera to take Log and RAW photos.
+        NSPhotoLibraryAddUsageDescription: LogPhoto saves the photos you take to your photo library.
+        # 通信も暗号化も使わないので、提出ごとの輸出規制の質問を省く
+        ITSAppUsesNonExemptEncryption: false
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.logphoto
+        # App Store Connect に登録する ID（一度登録すると変えられない）
+        PRODUCT_BUNDLE_IDENTIFIER: com.hame.logphoto
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
         MARKETING_VERSION: "1.16"

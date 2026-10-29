@@ -1,0 +1,3 @@
+/* Permission prompts (device language). The in-app UI language is a separate setting. */
+"NSCameraUsageDescription" = "LogPhoto uses the camera to take Log and RAW photos.";
+"NSPhotoLibraryAddUsageDescription" = "LogPhoto saves the photos you take to your photo library.";
