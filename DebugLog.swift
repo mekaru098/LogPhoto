@@ -10,6 +10,8 @@ final class DebugLog {
     private let queue = DispatchQueue(label: "logphoto.debuglog")
     private let maxBytes = 500_000
     private let cleanExitKey = "logphoto.cleanExit"
+    /// scripts/run_on_device.sh が起動時に渡す引数
+    static let launchedByScriptArg = "--launched-by-script"
     private let url: URL
     // queue 上でのみ使う
     private let formatter: DateFormatter = {
@@ -45,7 +47,12 @@ final class DebugLog {
         let os = UIDevice.current.systemVersion
         log("app", "===== launch v\(version) (\(build)) \(machine) iOS \(os) =====")
         if previousClean == false {
-            log("app", "前回は正常に終了しなかった（フォアグラウンド中のクラッシュ/強制終了の可能性）")
+            // scripts/run_on_device.sh は起動中のアプリを止めて入れ直すので、その場合は異常終了扱いにしない
+            if CommandLine.arguments.contains(Self.launchedByScriptArg) {
+                log("app", "スクリプトから起動（前回はフォアグラウンド中に終了したが、入れ直しによる停止とみなす）")
+            } else {
+                log("app", "前回は正常に終了しなかった（フォアグラウンド中のクラッシュ/強制終了の可能性）")
+            }
         }
     }
 

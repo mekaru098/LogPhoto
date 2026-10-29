@@ -13,7 +13,6 @@ struct ContentView: View {
     @ObservedObject private var language = AppLanguage.shared
     @State private var flash = false
     @State private var showGrid = true
-    @State private var showBadges = true
     @State private var showPanel = false
     @State private var pinchStartZoom: CGFloat? = nil
     // 露出は UI 側 @State で持ち、onChange でカメラへ反映する
@@ -216,32 +215,50 @@ struct ContentView: View {
     // MARK: - 上部
     private var topBar: some View {
         HStack(spacing: 8) {
-            if showBadges {
-                Text(camera.appleLogActive ? L("badge.appleLog")
-                     : (camera.logUnsupportedDevice ? L("badge.logUnsupported", camera.deviceName)
-                        : (camera.mode == .rawLog ? L("badge.rawMode") : L("badge.logOff"))))
+            Text(camera.appleLogActive ? L("badge.appleLog")
+                 : (camera.logUnsupportedDevice ? L("badge.logUnsupported", camera.deviceName)
+                    : (camera.mode == .rawLog ? L("badge.rawMode") : L("badge.logOff"))))
+                .font(.caption2.bold())
+                .tracking(0.6)
+                .foregroundStyle(camera.appleLogActive || camera.mode == .rawLog ? .white : .yellow)
+                .padding(.horizontal, 9).padding(.vertical, 5)
+                .background(.ultraThinMaterial, in: Capsule())
+            if camera.mode == .rawLog {
+                Text(camera.rawAvailable
+                     ? L(camera.rawIsProRAW ? "badge.proRawReady" : "badge.rawReady", camera.rawMegapixels)
+                     : L("badge.rawPreparing"))
                     .font(.caption2.bold())
                     .tracking(0.6)
-                    .foregroundStyle(camera.appleLogActive || camera.mode == .rawLog ? .white : .yellow)
+                    .foregroundStyle(camera.rawAvailable ? .white : .yellow)
                     .padding(.horizontal, 9).padding(.vertical, 5)
                     .background(.ultraThinMaterial, in: Capsule())
-                if camera.mode == .rawLog {
-                    Text(camera.rawAvailable
-                         ? L("badge.rawReady", camera.rawMegapixels) : L("badge.rawPreparing"))
-                        .font(.caption2.bold())
-                        .tracking(0.6)
-                        .foregroundStyle(camera.rawAvailable ? .white : .yellow)
-                        .padding(.horizontal, 9).padding(.vertical, 5)
-                        .background(.ultraThinMaterial, in: Capsule())
-                }
             }
             Spacer()
-            if showBadges {
-                Text(camera.deviceName)
-                    .font(.caption2)
+            // マクロとレンズ切替方式は、メニューを開かずに切り替えられるよう上部に置く
+            Button {
+                camera.setMacroMode(!camera.macroMode)
+            } label: {
+                Text(L("settings.macro"))
+                    .font(.caption2.bold())
+                    .foregroundStyle(camera.macroMode ? .black : .white)
                     .padding(.horizontal, 9).padding(.vertical, 5)
-                    .background(.ultraThinMaterial, in: Capsule())
+                    .background(camera.macroMode ? Color.white : Color.black.opacity(0.35),
+                                in: Capsule())
             }
+            Button {
+                camera.setLensSelectionMode(camera.lensSelectionMode == .auto ? .manual : .auto)
+            } label: {
+                Text(camera.lensSelectionMode == .auto ? L("settings.lensAuto") : L("settings.lensManual"))
+                    .font(.caption2.bold())
+                    .foregroundStyle(camera.lensSelectionMode == .manual ? .black : .white)
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(camera.lensSelectionMode == .manual ? Color.white : Color.black.opacity(0.35),
+                                in: Capsule())
+            }
+            Text(camera.deviceName)
+                .font(.caption2)
+                .padding(.horizontal, 9).padding(.vertical, 5)
+                .background(.ultraThinMaterial, in: Capsule())
             // シャッター音の ON/OFF
             Button {
                 camera.setShutterSound(!camera.shutterSoundEnabled)
@@ -249,15 +266,6 @@ struct ContentView: View {
                 Image(systemName: camera.shutterSoundEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
                     .font(.caption)
                     .foregroundStyle(camera.shutterSoundEnabled ? .white : .yellow)
-                    .frame(width: 30, height: 30)
-                    .background(.black.opacity(0.35), in: Circle())
-            }
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) { showBadges.toggle() }
-            } label: {
-                Image(systemName: showBadges ? "eye" : "eye.slash")
-                    .font(.caption)
-                    .foregroundStyle(.white)
                     .frame(width: 30, height: 30)
                     .background(.black.opacity(0.35), in: Circle())
             }
@@ -287,13 +295,11 @@ struct ContentView: View {
                     .font(.caption2)
                 Text(camera.focusStatus)
                     .font(.caption.bold())
-                if showBadges {
-                    Text("·").font(.caption)
-                    Text(camera.activeLensName
-                         + (camera.frameFormatCode.isEmpty ? "" : " " + camera.frameFormatCode))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.white.opacity(0.8))
-                }
+                Text("·").font(.caption)
+                Text(camera.activeLensName
+                     + (camera.frameFormatCode.isEmpty ? "" : " " + camera.frameFormatCode))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.8))
             }
             .foregroundStyle(.white)
             .padding(.horizontal, 10).padding(.vertical, 5)
@@ -589,7 +595,7 @@ struct ContentView: View {
 
     private var settingsPanel: some View {
         VStack(spacing: 14) {
-            // マニュアル・形式・画角・LUT
+            // マニュアル・形式・画角
             HStack(spacing: 10) {
                 Button {
                     camera.setManualMode(!camera.manualMode)
@@ -624,36 +630,49 @@ struct ContentView: View {
                         .background(Color.white.opacity(0.14), in: Capsule())
                 }
 
-                Picker("LUT", selection: lutSelection) {
-                    ForEach(camera.lutNames, id: \.self) { name in
-                        Text(name == "なし" ? L("lut.none") : name).tag(name)
-                    }
-                }
-                .pickerStyle(.menu)
-                .tint(.white)
+                Spacer(minLength: 0)
+            }
 
-                // LUT をプレビューだけに当てるか、保存にも焼き込むか
-                Button {
-                    camera.setBakeLUT(!camera.bakeLUTIntoFiles)
+            // LUT: 選ぶボタン（押すと一覧が出る）と追加ボタン。選んだ LUT はプレビューと保存の両方に掛かる
+            HStack(spacing: 10) {
+                Menu {
+                    Picker("LUT", selection: lutSelection) {
+                        ForEach(camera.lutNames, id: \.self) { name in
+                            Text(name == "なし" ? L("lut.none") : name).tag(name)
+                        }
+                    }
                 } label: {
-                    Text(camera.bakeLUTIntoFiles ? L("settings.lutBake") : L("settings.lutPreviewOnly"))
-                        .font(.caption2.bold())
-                        .foregroundStyle(camera.bakeLUTIntoFiles ? .black : .white)
-                        .padding(.horizontal, 7).padding(.vertical, 6)
-                        .background(camera.bakeLUTIntoFiles ? Color.white : Color.white.opacity(0.14),
-                                    in: Capsule())
+                    HStack(spacing: 5) {
+                        Text("LUT")
+                            .font(.caption.bold())
+                        Text(camera.selectedLUTName == "なし" ? L("lut.none") : camera.selectedLUTName)
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .foregroundStyle(camera.selectedLUTName == "なし" ? .white : .black)
+                    .padding(.horizontal, 11).padding(.vertical, 7)
+                    .background(camera.selectedLUTName == "なし" ? Color.white.opacity(0.14) : Color.white,
+                                in: Capsule())
                 }
 
                 Button {
                     showLUTImporter = true
                 } label: {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.body)
-                        .foregroundStyle(.white)
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus")
+                        Text(L("settings.lutAdd"))
+                    }
+                    .font(.caption.bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 11).padding(.vertical, 7)
+                    .background(Color.white.opacity(0.14), in: Capsule())
                 }
+
+                Spacer(minLength: 0)
             }
 
-            // グリッド・マクロ・露出補正
+            // グリッド・露出補正（マクロは上部バーへ移した）
             HStack(spacing: 12) {
                 Button {
                     showGrid.toggle()
@@ -663,17 +682,6 @@ struct ContentView: View {
                         .foregroundStyle(showGrid ? .white : .white.opacity(0.4))
                         .frame(width: 34, height: 34)
                         .background(.white.opacity(0.12), in: Circle())
-                }
-
-                Button {
-                    camera.setMacroMode(!camera.macroMode)
-                } label: {
-                    Text(L("settings.macro"))
-                        .font(.caption.bold())
-                        .foregroundStyle(camera.macroMode ? .black : .white)
-                        .padding(.horizontal, 10).padding(.vertical, 7)
-                        .background(camera.macroMode ? Color.white : Color.white.opacity(0.14),
-                                    in: Capsule())
                 }
 
                 Text(L("settings.exposure"))
@@ -722,33 +730,33 @@ struct ContentView: View {
                     .colorScheme(.dark)
                 }
 
-                Button {
-                    camera.setRawHighResolution(!camera.rawHighResolution)
-                } label: {
-                    Text(camera.rawHighResolution ? "48MP" : "12MP")
-                        .font(.caption.bold().monospacedDigit())
-                        .foregroundStyle(camera.rawHighResolution ? .black : .white)
-                        .padding(.horizontal, 9).padding(.vertical, 7)
-                        .background(camera.rawHighResolution ? Color.white : Color.white.opacity(0.14),
-                                    in: Capsule())
+                // RAW+Log は解像度（12MP / 48MP）、Log フレームは TIFF の階調（8bit / 10bit）を切り替える
+                if camera.mode == .rawLog {
+                    Button {
+                        camera.setRawHighResolution(!camera.rawHighResolution)
+                    } label: {
+                        Text(camera.rawHighResolution ? "48MP" : "12MP")
+                            .font(.caption.bold().monospacedDigit())
+                            .foregroundStyle(camera.rawHighResolution ? .black : .white)
+                            .padding(.horizontal, 9).padding(.vertical, 7)
+                            .background(camera.rawHighResolution ? Color.white : Color.white.opacity(0.14),
+                                        in: Capsule())
+                    }
+                } else {
+                    Button {
+                        camera.setLogFrame10Bit(!camera.logFrame10Bit)
+                    } label: {
+                        Text(camera.logFrame10Bit ? "10bit" : "8bit")
+                            .font(.caption.bold().monospacedDigit())
+                            .foregroundStyle(camera.logFrame10Bit ? .black : .white)
+                            .padding(.horizontal, 9).padding(.vertical, 7)
+                            .background(camera.logFrame10Bit ? Color.white : Color.white.opacity(0.14),
+                                        in: Capsule())
+                    }
+                    // 階調の切替は TIFF の書き出しだけに効く（JPEG は常に 8bit）
+                    .opacity(camera.logUnsupportedDevice || camera.outputFormat != .tiff ? 0.4 : 1)
+                    .disabled(camera.logUnsupportedDevice || camera.outputFormat != .tiff)
                 }
-                .opacity(camera.mode == .rawLog ? 1 : 0.4)
-                .disabled(camera.mode != .rawLog)
-            }
-
-            // レンズ切替方式（オート / マニュアル）
-            HStack(spacing: 10) {
-                Text(L("settings.lensMode"))
-                    .font(.caption.bold())
-                    .foregroundStyle(.white)
-                Picker(L("settings.lensMode"), selection: Binding(
-                    get: { camera.lensSelectionMode },
-                    set: { camera.setLensSelectionMode($0) })) {
-                    Text(L("settings.lensAuto")).tag(LogPhotoCamera.LensSelectionMode.auto)
-                    Text(L("settings.lensManual")).tag(LogPhotoCamera.LensSelectionMode.manual)
-                }
-                .pickerStyle(.segmented)
-                .colorScheme(.dark)
             }
 
             // 詳細設定（言語）
@@ -891,6 +899,22 @@ struct ContentView: View {
             Text(L("preset.hint"))
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.5))
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+                .layoutPriority(-1) // 幅が足りないときはヒントの方を縮める
+            // SS / ISO / 焦点 / WB のスライダーを初期値へ（各行のダブルタップと同じ値）
+            Button {
+                resetManualSliders()
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.counterclockwise")
+                    Text(L("manual.reset"))
+                }
+                .font(.caption2.bold())
+                .foregroundStyle(.white)
+                .padding(.horizontal, 8).padding(.vertical, 5)
+                .background(Color.white.opacity(0.14), in: Capsule())
+            }
         }
         .padding(.bottom, 2)
     }
@@ -967,6 +991,11 @@ struct ContentView: View {
         exposureEV = 0
         camera.setZoom(1.0, ramp: true, switchLensNow: true)
         zoomLogUI = 0
+        resetManualSliders()
+    }
+
+    /// マニュアルの SS / ISO / 焦点 / WB だけを初期値へ（ズームと露出補正はそのまま）。
+    private func resetManualSliders() {
         shutterLog = log2(1.0 / 60)
         camera.isoValue = defaultISO
         camera.focusPosition = 0.5

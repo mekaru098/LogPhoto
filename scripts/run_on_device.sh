@@ -76,7 +76,8 @@ if [[ $DO_INSTALL -eq 1 ]]; then
   echo "==> 起動"
   LAUNCH=(xcrun devicectl device process launch --device "$DEVICE")
   # shellcheck disable=SC2206
-  ARGS=($LAUNCH_ARGS)
+  # --launched-by-script: 入れ直しで止めた前回の終了を、アプリが異常終了と誤検知しないための目印
+  ARGS=(--launched-by-script $LAUNCH_ARGS)
   if ! "${LAUNCH[@]}" --terminate-existing "$BUNDLE_ID" ${ARGS[@]+"${ARGS[@]}"} >/dev/null 2>"build/launch-$STAMP.err"; then
     # 古い devicectl では --terminate-existing が無いことがあるので、無しで再試行する
     if ! "${LAUNCH[@]}" "$BUNDLE_ID" ${ARGS[@]+"${ARGS[@]}"} >/dev/null 2>>"build/launch-$STAMP.err"; then

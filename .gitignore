@@ -1,6 +1,8 @@
 # xcodegen で生成されるもの
 LogPhoto.xcodeproj/
 Info.plist
+# ビルド時に AppIcon.b64 から復元される
+Assets.xcassets/AppIcon.appiconset/AppIcon1024.png
 
 # ビルド成果物・実機ログ
 build/

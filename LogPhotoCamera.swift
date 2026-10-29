@@ -65,6 +65,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     /// RAW を 48MP（センサーの最大）で撮る。OFF は 12MP。
     @Published var rawHighResolution: Bool = UserDefaults.standard.bool(forKey: "logphoto.raw48")
     @Published var rawMegapixels: Double = 0   // 現在の写真サイズ（検証表示用）
+    @Published var rawIsProRAW = false          // RAW+Log が Apple ProRAW で撮るか（48MP 設定時）
+    @Published var logFrame10Bit: Bool = UserDefaults.standard.object(forKey: "logphoto.log10bit") as? Bool ?? true
     @Published var statusText = L("status.preparing")
     @Published var mode: CaptureMode = .logFrame
     /// 表示倍率（レンズ基準: 広角 = 1x）。管理値 desiredZoom をそのまま公開する。
@@ -100,7 +102,6 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     @Published var lutNames: [String] = ["なし"]
     @Published var selectedLUTName: String = "なし"
     /// LUT を保存画像にも焼き込むか（false = プレビューだけに当てる。保存は Log のまま）
-    @Published var bakeLUTIntoFiles: Bool = UserDefaults.standard.bool(forKey: "logphoto.bakeLUT")
     private let lutStore = LUTStore()
     private var lutEntries: [String: LUTStore.Entry] = [:]
     private let lutLock = NSLock()
@@ -144,7 +145,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
         NotificationCenter.default.addObserver(
             self, selector: #selector(subjectAreaDidChange(_:)),
-            name: .AVCaptureDeviceSubjectAreaDidChange, object: nil)
+            name: AVCaptureDevice.subjectAreaDidChangeNotification, object: nil)
         // セッションの異常・中断・メモリ警告を記録する（切替でおかしくなる原因の切り分け用）
         NotificationCenter.default.addObserver(
             self, selector: #selector(sessionRuntimeError(_:)),
@@ -158,6 +159,58 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         NotificationCenter.default.addObserver(
             self, selector: #selector(memoryWarningReceived(_:)),
             name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+        // バックグラウンドでは GPU が使えないので、RAW→Log 変換の方法を切り替える
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appDidEnterBackground(_:)),
+            name: UIApplication.didEnterBackgroundNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appWillEnterForeground(_:)),
+            name: UIApplication.willEnterForegroundNotification, object: nil)
+    }
+
+    // MARK: - バックグラウンドでの撮影処理の継続
+    @objc private func appDidEnterBackground(_ note: Notification) {
+        appInBackground = true
+        if pendingBackgroundWork > 0 {
+            dlog("raw", "バックグラウンドへ。未完了の撮影処理 \(pendingBackgroundWork) 件を続ける（Log 変換は CPU）")
+        }
+    }
+
+    @objc private func appWillEnterForeground(_ note: Notification) {
+        appInBackground = false
+    }
+
+    /// 撮影処理（撮影〜保存〜Log 変換）を 1 つ受け付けた。最初の 1 つでバックグラウンド実行の
+    /// 時間をもらう（アプリを離れても、もらえた時間（通常 30 秒ほど）は処理を続ける）。
+    /// シャッターを押した時点で呼ぶ。結果が届いてから申請すると、先にアプリが裏へ回った場合に
+    /// 申請が間に合わず、DNG の保存も変換も止められていた（実測）。
+    private func backgroundWorkStarted() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.pendingBackgroundWork += 1
+            guard self.backgroundWorkTask == .invalid else { return }
+            self.backgroundWorkTask = UIApplication.shared.beginBackgroundTask(withName: "LogPhotoCapture") {
+                dlog("raw", "バックグラウンドの時間切れ（未完了の撮影処理 \(self.pendingBackgroundWork) 件。アプリに戻ると続きを処理）")
+                self.endBackgroundWorkTask()
+            }
+            if self.backgroundWorkTask == .invalid {
+                dlog("raw", "バックグラウンド実行の時間をもらえなかった（アプリを離れると処理が止まる）")
+            }
+        }
+    }
+
+    /// 1 つの処理が終わった（失敗も含む）。全部終わったら時間を返す。
+    private func backgroundWorkFinished() {
+        DispatchQueue.main.async {
+            self.pendingBackgroundWork = max(0, self.pendingBackgroundWork - 1)
+            if self.pendingBackgroundWork == 0 { self.endBackgroundWorkTask() }
+        }
+    }
+
+    private func endBackgroundWorkTask() {
+        guard backgroundWorkTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundWorkTask)
+        backgroundWorkTask = .invalid
     }
 
     // MARK: - セッション監視（ログ＋自動再開）
@@ -217,8 +270,29 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private let videoOutput = AVCaptureVideoDataOutput()
     private let photoOutput = AVCapturePhotoOutput()
     private let ciContext = CIContext()
-    /// RAW→Log 変換専用（中間結果をキャッシュせずメモリを抑える）
-    private let rawConvertContext = CIContext(options: [.cacheIntermediates: false])
+    /// RAW→Log 変換専用（中間結果をキャッシュせずメモリを抑える）。作業空間はリニア sRGB に明示し、
+    /// GPU カーネルが受け取る値を CPU 版（linearSRGB で取り出して計算）と同じにする。
+    private let rawConvertContext = CIContext(options: [
+        .cacheIntermediates: false,
+        .workingColorSpace: CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!])
+    /// バックグラウンド用。iOS はバックグラウンドで GPU を使わせないので CPU で描く（遅い）。
+    /// rawConversionQueue 上でのみ使う。
+    private lazy var rawConvertSoftwareContext = CIContext(options: [
+        .cacheIntermediates: false, .useSoftwareRenderer: true,
+        .workingColorSpace: CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!])
+    private lazy var rawSoftwareContext = CIContext(options: [
+        .workingColorSpace: NSNull(), .outputColorSpace: NSNull(), .useSoftwareRenderer: true])
+    private var lastRawLogPath = ""   // 直近の RAW→Log 変換の方法（GPU / CPU。ログ用）
+    // アプリがバックグラウンドにいるか（変換キューから読むのでロックで守る）
+    private let appStateLock = NSLock()
+    private var appInBackgroundStore = false
+    private var appInBackground: Bool {
+        get { appStateLock.lock(); defer { appStateLock.unlock() }; return appInBackgroundStore }
+        set { appStateLock.lock(); appInBackgroundStore = newValue; appStateLock.unlock() }
+    }
+    // 未完了の撮影処理（撮影〜保存〜Log 変換）の数と、バックグラウンドで続けるためのタスク（main スレッドでのみ使う）
+    private var pendingBackgroundWork = 0
+    private var backgroundWorkTask: UIBackgroundTaskIdentifier = .invalid
     private let rawConversionQueue = DispatchQueue(label: "logphoto.rawconvert", qos: .utility)
     private var lastRawLogStats = ""  // 直近の RAW→Log 変換の符号値統計（検証表示用）
     /// 色管理変換をしないレンダリング用（Log の画素値をそのまま書き出すため）
@@ -249,9 +323,17 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     private var zoomApplyScheduled = false
     private var rawSetupToken = 0                 // RAW ポーリングの無効化用
     private var rawUsesPhotoPreset = false
-    private var pendingRawZoom: CGFloat = 1       // 撮影時のデバイス倍率（DNG 変換画像のトリミング用）
+    private var rawSetupInProgress = false
+    private var rawPhotoPresetDeviceIDs = Set<String>()  // .photo プリセットでしか RAW が出なかったレンズ
+    private var pendingRawShutterUntil: Date? = nil      // RAW 準備中に押されたシャッター（この時刻まで有効）
+    // 撮影ごとの切り出し倍率（DNG 変換画像のトリミング用）。キーは AVCapturePhotoSettings.uniqueID。
+    // 変換は撮影より遅れて走るので、1 つの変数だと連写で後の撮影の倍率に上書きされていた。
+    private var rawCropByCaptureID: [Int64: CGFloat] = [:]
+    private var rawRequestedDimsByCaptureID: [Int64: CMVideoDimensions] = [:] // ProRAW で指定した解像度（検証用）
+    private let rawCropLock = NSLock()
     private var lastFrameWidth = 0
     private var lastFrameHeight = 0
+    private var lastFramePixelFormat: OSType = 0
     @Published var macroMode = false
     @Published var previewFrameSize: CGSize = .zero
     @Published var focusStatus = L("af.auto")
@@ -562,7 +644,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         guard !dims.isEmpty else { return }
         func area(_ d: CMVideoDimensions) -> Int { Int(d.width) * Int(d.height) }
         let chosen: CMVideoDimensions?
-        if mode == .rawLog, rawHighResolution {
+        // 48MP は Apple ProRAW のときだけ。通常の Bayer RAW は 48MP を指定しても 12MP しか出ない。
+        if mode == .rawLog, rawHighResolution, photoOutput.isAppleProRAWEnabled {
             chosen = dims.max { area($0) < area($1) } // 48MP（対応フォーマットなら）
         } else {
             let limit = 13_000_000
@@ -571,16 +654,66 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
         if let chosen {
             photoOutput.maxPhotoDimensions = chosen
-            let mp = Double(area(chosen)) / 1_000_000
-            DispatchQueue.main.async { self.rawMegapixels = mp }
+            // 8064x6048 は 48.8MP。四捨五入すると「49MP」になりボタンの「48MP」と合わないので切り捨てる
+            let mp = floor(Double(area(chosen)) / 1_000_000)
+            let proRAW = photoOutput.isAppleProRAWEnabled
+            DispatchQueue.main.async {
+                self.rawMegapixels = mp
+                self.rawIsProRAW = proRAW
+            }
         }
     }
 
-    /// RAW の解像度切替（12MP / 48MP）。maxPhotoDimensions は動作中でも変更できる。
+    /// RAW の解像度切替（12MP = Bayer RAW / 48MP = Apple ProRAW）。
+    /// ProRAW の有効・無効は出力の再構成になるので、RAW の準備をやり直す。
     func setRawHighResolution(_ on: Bool) {
         rawHighResolution = on
         UserDefaults.standard.set(on, forKey: "logphoto.raw48")
-        sessionQueue.async { [weak self] in self?.applyMaxPhotoDimensions() }
+        dlog("raw", "RAW 解像度 → \(on ? "48MP（ProRAW）" : "12MP（Bayer RAW）")")
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            guard self.mode == .rawLog else { return }
+            DispatchQueue.main.async { self.rawAvailable = false }
+            self.beginRawSetup()
+        }
+    }
+
+    /// Log フレームを TIFF で保存するときの階調（10bit = 16bit TIFF / 8bit = 8bit TIFF、約半分の大きさ）。
+    /// フレーム自体は Apple Log では常に 10bit（x422）で届く。ビデオ出力を BGRA に指定し直すと
+    /// setVideoSettings が例外で落ちるので、出力側は触らず書き出しで切り替える。
+    func setLogFrame10Bit(_ on: Bool) {
+        logFrame10Bit = on
+        UserDefaults.standard.set(on, forKey: "logphoto.log10bit")
+        dlog("capture", "Log フレームの TIFF → \(on ? "16bit（10bit の階調）" : "8bit")")
+    }
+
+    /// 48MP 設定の RAW+Log では Apple ProRAW を使う。
+    private var wantsProRAW: Bool { mode == .rawLog && rawHighResolution }
+
+    /// ProRAW を有効・無効にする（sessionQueue 上）。切り替えたら true。
+    /// 出力の再構成になるので begin/commit で囲み、写真サイズも合わせ直す。
+    @discardableResult
+    private func setProRAWEnabled(_ on: Bool) -> Bool {
+        let enable = on && photoOutput.isAppleProRAWSupported
+        guard photoOutput.isAppleProRAWEnabled != enable else { return false }
+        dlog("raw", "Apple ProRAW → \(enable ? "ON" : "OFF") device=\(captureDevice?.localizedName ?? "nil")")
+        session.beginConfiguration()
+        photoOutput.isAppleProRAWEnabled = enable
+        // 写真サイズも同じ再構成の中で合わせる。commit 後に 48MP へ変えると、その反映が
+        // 終わる前（直後）に撮った ProRAW が 12MP 相当（約 20MB）になっていた
+        applyMaxPhotoDimensions()
+        session.commitConfiguration()
+        return true
+    }
+
+    /// 撮影に使う RAW 形式。ProRAW が有効ならそれを、なければ Bayer RAW を選ぶ。
+    private func preferredRawPixelFormat() -> OSType? {
+        let types = photoOutput.availableRawPhotoPixelFormatTypes
+        if photoOutput.isAppleProRAWEnabled,
+           let pro = types.first(where: { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }) {
+            return pro
+        }
+        return types.first(where: { AVCapturePhotoOutput.isBayerRAWPixelFormat($0) }) ?? types.first
     }
 
     /// モードに応じて Log 用 / RAW 用のフォーマットと色空間をデバイスに設定する
@@ -787,6 +920,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 session.sessionPreset = .inputPriority
                 rawUsesPhotoPreset = false
             }
+            // ProRAW は .photo プリセットに戻したあと beginRawSetup で有効にし直す
+            // （inputPriority のフォーマットでは非対応のことがある）
+            if photoOutput.isAppleProRAWEnabled {
+                photoOutput.isAppleProRAWEnabled = false
+            }
             if deviceChanged, let newInput {
                 let oldInputs = session.inputs
                 for input in oldInputs { session.removeInput(input) }
@@ -815,6 +953,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         if mode == .rawLog {
             beginRawSetup()
         } else {
+            rawSetupInProgress = false
+            pendingRawShutterUntil = nil // RAW 以外へ切り替えたら、待っていたシャッターは取り消す
+            setProRAWEnabled(false)
             DispatchQueue.main.async { self.rawAvailable = false }
         }
     }
@@ -831,17 +972,70 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     /// 2) それでも有効にならなければ写真優先プリセット（.photo）へ切り替えて再確認する
     private func beginRawSetup() {
         rawSetupToken += 1
-        pollRawTypes(attempt: 0, photoPresetStage: false, token: rawSetupToken)
+        rawSetupInProgress = true
+        let token = rawSetupToken
+        if !wantsProRAW { setProRAWEnabled(false) } // 12MP 設定は Bayer RAW
+        // 前に .photo プリセットでしか RAW が出なかったレンズは、0.3 秒 × 5 回待たずにすぐ切り替える
+        // （レンズを替えるたびに約 1.5 秒、撮影できない時間ができていた）
+        if !rawUsesPhotoPreset, photoOutput.availableRawPhotoPixelFormatTypes.isEmpty,
+           let id = captureDevice?.uniqueID, rawPhotoPresetDeviceIDs.contains(id) {
+            switchRawToPhotoPreset(token: token, reason: "前回 .photo が必要だったレンズ")
+            return
+        }
+        pollRawTypes(attempt: 0, photoPresetStage: false, token: token)
     }
 
     private func pollRawTypes(attempt: Int, photoPresetStage: Bool, token: Int) {
         guard token == rawSetupToken, mode == .rawLog else { return }
         if !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
-            dlog("raw", "RAW 準備OK attempt=\(attempt) photoPreset=\(photoPresetStage) device=\(captureDevice?.localizedName ?? "nil")")
-            DispatchQueue.main.async { self.rawAvailable = true }
-            // 構成変更でリセットされ得る倍率を管理値に合わせ直す
-            applyDesiredZoom(ramp: false)
-            setStatus(L("status.rawReady"))
+            // 48MP 設定なら、RAW が出たところで ProRAW を有効にして確認し直す
+            if wantsProRAW, setProRAWEnabled(true) {
+                pollRawTypes(attempt: 0, photoPresetStage: photoPresetStage, token: token)
+                return
+            }
+            if wantsProRAW, !photoOutput.isAppleProRAWSupported, !photoPresetStage {
+                // ProRAW は .photo プリセットでなら使えることがあるので試す
+                switchRawToPhotoPreset(token: token, reason: "inputPriority では ProRAW 非対応")
+                return
+            }
+            let isProRAW = preferredRawPixelFormat().map { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) } ?? false
+            if photoOutput.isAppleProRAWEnabled, !isProRAW, attempt < 4 {
+                // ProRAW を有効にした直後で、まだ ProRAW 形式が出ていない
+                sessionQueue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    self?.pollRawTypes(attempt: attempt + 1, photoPresetStage: photoPresetStage,
+                                       token: token)
+                }
+                return
+            }
+            if photoOutput.isAppleProRAWEnabled, !isProRAW {
+                setProRAWEnabled(false) // 待っても ProRAW 形式が出なければ Bayer RAW で撮る
+            }
+            dlog("raw", "RAW 準備OK kind=\(isProRAW ? "ProRAW" : "Bayer") attempt=\(attempt) photoPreset=\(photoPresetStage) device=\(captureDevice?.localizedName ?? "nil")")
+            if wantsProRAW, !isProRAW {
+                dlog("raw", "このレンズ・構成では ProRAW が使えないため Bayer RAW（12MP）で撮影 supported=\(photoOutput.isAppleProRAWSupported)")
+            }
+            if isProRAW, let rawType = preferredRawPixelFormat() {
+                // ProRAW は出力側の準備が終わる前に撮ると、48MP を指定しても 12MP で返ってくる（実測）。
+                // 撮影設定を前もって準備させ、終わってから「準備OK」にする（その間のシャッターは待たせる）。
+                let settings = makeRawPhotoSettings(rawType: rawType)
+                let dims = settings.maxPhotoDimensions
+                let started = CACurrentMediaTime()
+                photoOutput.setPreparedPhotoSettingsArray([settings]) { [weak self] prepared, error in
+                    self?.sessionQueue.async {
+                        guard let self, token == self.rawSetupToken, self.mode == .rawLog else { return }
+                        dlog("raw", "ProRAW の撮影準備 \(prepared ? "OK" : "失敗") \(String(format: "%.2f", CACurrentMediaTime() - started))秒 dims=\(dims.width)x\(dims.height) \(error?.localizedDescription ?? "")")
+                        self.finishRawSetupSuccess(photoPresetStage: photoPresetStage)
+                    }
+                }
+                // 準備の完了が届かないまま止まらないよう、3 秒で打ち切って先へ進む
+                sessionQueue.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    guard let self, token == self.rawSetupToken, self.rawSetupInProgress else { return }
+                    dlog("raw", "ProRAW の撮影準備が 3 秒で終わらないため、このまま準備OKにする")
+                    self.finishRawSetupSuccess(photoPresetStage: photoPresetStage)
+                }
+                return
+            }
+            finishRawSetupSuccess(photoPresetStage: photoPresetStage)
             return
         }
         if attempt < 4 {
@@ -852,23 +1046,79 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             return
         }
         if !photoPresetStage {
-            // 段階2: 写真優先プリセットで再構成する
-            dlog("raw", "RAW 形式が現れない → .photo プリセットで再構成 device=\(captureDevice?.localizedName ?? "nil")")
-            session.beginConfiguration()
-            session.sessionPreset = .photo
-            session.commitConfiguration()
-            rawUsesPhotoPreset = true
-            applyVideoRotation()
-            applyMaxPhotoDimensions()
-            applyDesiredZoom(ramp: false)
-            pollRawTypes(attempt: 0, photoPresetStage: true, token: token)
+            switchRawToPhotoPreset(token: token, reason: "RAW 形式が現れない")
             return
         }
         finishRawSetupFailure()
     }
 
+    /// RAW の準備ができた（sessionQueue 上）。撮影を受け付け、待っていたシャッターがあれば撮る。
+    private func finishRawSetupSuccess(photoPresetStage: Bool) {
+        guard rawSetupInProgress else { return } // 準備完了の通知と打ち切りの両方から呼ばれ得る
+        rawSetupInProgress = false
+        if photoPresetStage, let id = captureDevice?.uniqueID {
+            rawPhotoPresetDeviceIDs.insert(id)
+        }
+        DispatchQueue.main.async { self.rawAvailable = true }
+        // 構成変更でリセットされ得る倍率を管理値に合わせ直す
+        applyDesiredZoom(ramp: false)
+        setStatus(L("status.rawReady"))
+        firePendingRawShutter()
+    }
+
+    /// RAW 撮影の設定（撮影と事前準備で同じ内容にする）。
+    private func makeRawPhotoSettings(rawType: OSType) -> AVCapturePhotoSettings {
+        let settings = AVCapturePhotoSettings(rawPixelFormatType: rawType)
+        if AVCapturePhotoOutput.isAppleProRAWPixelFormat(rawType) {
+            // ProRAW は写真ごとに解像度を指定しないと 12MP になる（出力側の上限以下にする）。
+            // 画質の優先度は既定の .balanced のまま（Bayer と違って .speed の制約はない）。
+            settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+        } else {
+            // AVFoundation の規則: Bayer RAW では photoQualityPrioritization は .speed 必須
+            // （.balanced/.quality は設定時に例外、既定の .balanced のままでも capturePhoto で例外）。
+            settings.photoQualityPrioritization = .speed
+        }
+        // 可能な機種では無音化（日本向け端末では非対応のことが多い）
+        if !shutterSoundEnabled, photoOutput.isShutterSoundSuppressionSupported {
+            settings.isShutterSoundSuppressionEnabled = true
+        }
+        return settings
+    }
+
+    /// 段階2: 写真優先プリセット（.photo）で再構成して RAW 形式を確認する。
+    private func switchRawToPhotoPreset(token: Int, reason: String) {
+        dlog("raw", "\(reason) → .photo プリセットで再構成 device=\(captureDevice?.localizedName ?? "nil")")
+        session.beginConfiguration()
+        session.sessionPreset = .photo
+        session.commitConfiguration()
+        rawUsesPhotoPreset = true
+        applyVideoRotation()
+        applyMaxPhotoDimensions()
+        applyDesiredZoom(ramp: false)
+        pollRawTypes(attempt: 0, photoPresetStage: true, token: token)
+    }
+
+    /// RAW 準備中に押されたシャッターを、準備ができたところで撮る（sessionQueue 上）。
+    private func firePendingRawShutter() {
+        guard let until = pendingRawShutterUntil else { return }
+        pendingRawShutterUntil = nil
+        if Date() <= until {
+            dlog("raw", "待っていたシャッターを撮影 device=\(captureDevice?.localizedName ?? "nil")")
+            captureRawLogPhoto()
+        } else {
+            // 押してから時間が経ちすぎた（構図が変わっている）ので撮らず、撮れなかったことを伝える
+            dlog("raw", "待っていたシャッターは期限切れのため撮影せず")
+            setStatus(L("status.rawShotDropped"))
+        }
+    }
+
     private func finishRawSetupFailure() {
         dlog("raw", "RAW セットアップ失敗（.photo プリセットでも形式なし） device=\(captureDevice?.localizedName ?? "nil")")
+        rawSetupInProgress = false
+        if let id = captureDevice?.uniqueID { rawPhotoPresetDeviceIDs.remove(id) }
+        let hadPendingShutter = pendingRawShutterUntil != nil
+        pendingRawShutterUntil = nil
+        setProRAWEnabled(false)
         if rawUsesPhotoPreset {
             session.beginConfiguration()
             session.sessionPreset = .inputPriority
@@ -877,7 +1127,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
         if let device = captureDevice { applyDeviceConfiguration(device) }
         DispatchQueue.main.async { self.rawAvailable = false }
-        setStatus(L("status.rawUnavailable"))
+        if hadPendingShutter { dlog("raw", "待っていたシャッターは RAW が使えないため撮影せず") }
+        setStatus(L(hadPendingShutter ? "status.rawShotDropped" : "status.rawUnavailable"))
     }
 
     /// モード切替時に UI から呼ばれる。
@@ -888,8 +1139,10 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
     }
 
-    /// マクロ（超広角＋近距離AF）の ON/OFF。
+    /// マクロ（超広角＋近距離AF）の ON/OFF。マクロ中はレンズを選んでもマクロを優先し、
+    /// 選んだ画角に合わせて超広角を切り抜く。マクロを切るのはこのボタンだけ。
     func setMacroMode(_ on: Bool) {
+        dlog("lens", "マクロ → \(on ? "ON" : "OFF")")
         macroMode = on
         sessionQueue.async { [weak self] in
             guard let self else { return }
@@ -956,13 +1209,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         return activeLUTSnapshot
     }
 
-    /// 保存時に使う LUT（焼き込みが OFF なら nil）
-    private var savedLUT: LUTStore.Entry? { bakeLUTIntoFiles ? activeLUT : nil }
-
-    func setBakeLUT(_ on: Bool) {
-        bakeLUTIntoFiles = on
-        UserDefaults.standard.set(on, forKey: "logphoto.bakeLUT")
-    }
+    /// 保存時に使う LUT。選んだ LUT は常に保存にも焼き込む（「なし」なら Log のまま保存）。
+    /// 以前は「表示のみ / 保存にも」を切り替えられたが、分かりにくいので焼き込みに統一した。
+    private var savedLUT: LUTStore.Entry? { activeLUT }
 
     private func applyLUT(to image: CIImage) -> CIImage {
         applyLUT(to: image, entry: activeLUT)
@@ -1389,12 +1638,18 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
         let formatCode = fourCharCode(CVPixelBufferGetPixelFormatType(buffer))
         let isTIFF = outputFormat == .tiff
+        let tiff16 = logFrame10Bit
+        dlog("capture", "Log フレーム撮影 frame=\(formatCode) \(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)) 出力=\(isTIFF ? (tiff16 ? "TIFF 16bit" : "TIFF 8bit") : "JPEG 8bit") appleLog=\(appleLogActive)")
+        // 撮った直後にアプリを離れても、変換と保存（16bit TIFF は 37MB）を終えられるようにする
+        backgroundWorkStarted()
 
         // LUT なし & BGRA & フル画角: 画素値をそのまま書き出す（最速・無変換）
         if savedLUT == nil, !aspectFourThree,
            let data = imageDataFromPixelBuffer(buffer, isTIFF: isTIFF) {
             updateThumbnail(from: data)
-            savePhotoData(data, completion: logSaveMessage(isTIFF: isTIFF, formatCode: formatCode))
+            // BGRA のそのまま書き出しは 8bit
+            savePhotoData(data, completion: logSaveMessage(isTIFF: isTIFF, tiff16: false, formatCode: formatCode),
+                          onFinish: { [weak self] in self?.backgroundWorkFinished() })
             return
         }
         // それ以外（LUT適用 / TIFF / 非BGRA形式 / 4:3）は色管理なしの CI レンダリング。
@@ -1402,22 +1657,25 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         if aspectFourThree { image = cropToFourThree(image) }
         image = applyLUT(to: image, entry: savedLUT)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-        // TIFF は 16bit で書き出し、10bit の Log フレーム（x422 など）の階調を落とさない
+        // TIFF は既定で 16bit で書き出し、10bit の Log フレーム（x422 など）の階調を落とさない。
+        // 8bit を選んだときは 8bit TIFF（約半分の大きさ）
         let data = isTIFF
-            ? rawContext.tiffRepresentation(of: image, format: .RGBA16, colorSpace: colorSpace)
+            ? rawContext.tiffRepresentation(of: image, format: tiff16 ? .RGBA16 : .RGBA8, colorSpace: colorSpace)
             : rawContext.jpegRepresentation(of: image, colorSpace: colorSpace)
         guard let data else {
             dlog("capture", "Log フレーム変換失敗 format=\(formatCode) tiff=\(isTIFF)")
             setStatus(L("status.convertFailed", formatCode))
+            backgroundWorkFinished()
             return
         }
         updateThumbnail(from: data)
-        savePhotoData(data, completion: logSaveMessage(isTIFF: isTIFF, formatCode: formatCode))
+        savePhotoData(data, completion: logSaveMessage(isTIFF: isTIFF, tiff16: tiff16, formatCode: formatCode),
+                      onFinish: { [weak self] in self?.backgroundWorkFinished() })
     }
 
     /// 保存メッセージに「本当に Apple Log だったか」を含める（検証用）。
-    private func logSaveMessage(isTIFF: Bool, formatCode: String) -> String {
-        let kind = isTIFF ? L("status.logPhotoTiff") : L("status.logPhoto")
+    private func logSaveMessage(isTIFF: Bool, tiff16: Bool = true, formatCode: String) -> String {
+        let kind = isTIFF ? L(tiff16 ? "status.logPhotoTiff" : "status.logPhotoTiff8") : L("status.logPhoto")
         let logState = appleLogActive ? "Apple Log" : L("status.logOff")
         return L("status.logSaved", kind, logState, formatCode)
     }
@@ -1511,12 +1769,26 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     func captureRawLogPhoto() {
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            guard let rawType = self.photoOutput.availableRawPhotoPixelFormatTypes.first else {
-                dlog("raw", "撮影要求したが RAW 形式なし → 再構成 device=\(self.captureDevice?.localizedName ?? "nil") running=\(self.session.isRunning)")
-                self.setStatus(L("status.rawNotReady"))
-                self.reconcileInput()
+            // 準備中（ProRAW の有効化待ちで Bayer だけ出ている間も含む）なら撮らずに待つ
+            guard !self.rawSetupInProgress, let rawType = self.preferredRawPixelFormat() else {
+                // レンズ切替直後などで RAW が準備中。画面は光っているので、ここで捨てると
+                // 撮れたつもりで撮れていない。押した 1 枚を覚えておき、準備でき次第撮る。
+                let until = Date().addingTimeInterval(5)
+                self.pendingRawShutterUntil = until
+                dlog("raw", "撮影要求したが RAW 準備中 → 準備でき次第撮影 setupInProgress=\(self.rawSetupInProgress) device=\(self.captureDevice?.localizedName ?? "nil") running=\(self.session.isRunning)")
+                self.setStatus(L("status.rawWaiting"))
+                // 準備中なら待つだけ（再構成すると準備がやり直しになって遅くなる）
+                if !self.rawSetupInProgress { self.reconcileInput() }
+                // 準備が終わらないまま黙って消えないよう、期限が来たら撮れなかったことを伝える
+                self.sessionQueue.asyncAfter(deadline: .now() + 5.1) { [weak self] in
+                    guard let self, self.pendingRawShutterUntil == until else { return }
+                    self.pendingRawShutterUntil = nil
+                    dlog("raw", "待っていたシャッターは RAW の準備が 5 秒で終わらず撮影せず")
+                    self.setStatus(L("status.rawShotDropped"))
+                }
                 return
             }
+            let isProRAW = AVCapturePhotoOutput.isAppleProRAWPixelFormat(rawType)
             // RAW の要件: デバイス倍率 1.0（念のためここでも保証）。切り出し倍率は別に覚える。
             if let device = self.captureDevice, device.videoZoomFactor != 1.0,
                (try? device.lockForConfiguration()) != nil {
@@ -1528,20 +1800,17 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                connection.videoScaleAndCropFactor != 1.0 {
                 connection.videoScaleAndCropFactor = 1.0
             }
-            self.pendingRawZoom = self.previewCropFactor
             let dims = self.photoOutput.maxPhotoDimensions
             let fmt = self.fourCharCode(rawType)
             self.markRawStage("1 設定作成（\(fmt) \(dims.width)x\(dims.height) preset=\(self.rawUsesPhotoPreset ? "photo" : "input")）")
-            dlog("raw", "撮影要求 fmt=\(fmt) dims=\(dims.width)x\(dims.height) device=\(self.captureDevice?.localizedName ?? "nil") zoom=\(self.captureDevice?.videoZoomFactor ?? 0) crop=\(self.previewCropFactor) preset=\(self.rawUsesPhotoPreset ? "photo" : "input") running=\(self.session.isRunning)")
-            let settings = AVCapturePhotoSettings(rawPixelFormatType: rawType)
-            // AVFoundation の規則: Bayer RAW では photoQualityPrioritization は .speed 必須
-            // （.balanced/.quality は設定時に例外、既定の .balanced のままでも capturePhoto で例外）。
-            settings.photoQualityPrioritization = .speed
-            // 可能な機種では無音化（日本向け端末では非対応のことが多い）
-            if !self.shutterSoundEnabled, self.photoOutput.isShutterSoundSuppressionSupported {
-                settings.isShutterSoundSuppressionEnabled = true
-            }
+            dlog("raw", "撮影要求 kind=\(isProRAW ? "ProRAW" : "Bayer") fmt=\(fmt) dims=\(dims.width)x\(dims.height) device=\(self.captureDevice?.localizedName ?? "nil") zoom=\(self.captureDevice?.videoZoomFactor ?? 0) crop=\(self.previewCropFactor) preset=\(self.rawUsesPhotoPreset ? "photo" : "input") running=\(self.session.isRunning)")
+            let settings = self.makeRawPhotoSettings(rawType: rawType)
+            self.rawCropLock.lock()
+            self.rawCropByCaptureID[settings.uniqueID] = self.previewCropFactor
+            if isProRAW { self.rawRequestedDimsByCaptureID[settings.uniqueID] = dims }
+            self.rawCropLock.unlock()
             self.markRawStage("2 capturePhoto 呼び出し（\(fmt) \(dims.width)x\(dims.height)）")
+            self.backgroundWorkStarted() // 結果の受信と DNG 保存まで（didFinishProcessingPhoto で引き継ぐ）
             self.photoOutput.capturePhoto(with: settings, delegate: self)
             self.markRawStage("3 撮影要求済み・結果待ち")
             self.setStatus(L("status.rawCapturing"))
@@ -1549,7 +1818,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     }
 
     /// RAW(DNG) から Log変換画像（JPEG / TIFF）を作る。LUT 選択時は適用する。失敗時は nil。
-    private func makeLogImageData(fromDNG data: Data, format: OutputFormat) -> Data? {
+    private func makeLogImageData(fromDNG data: Data, format: OutputFormat, crop: CGFloat) -> Data? {
         guard let rawFilter = CIRAWFilter(imageData: data, identifierHint: "dng") else { return nil }
         // 現像側のトーンカーブを全部切り、シーンリニアで受け取る（Log はこちらで掛ける）
         rawFilter.boostAmount = 0
@@ -1559,26 +1828,42 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         guard var image = rawFilter.outputImage else { return nil }
 
         // 撮影時の倍率に合わせてセンタートリミング（DNG 本体はフル画角のまま）
-        if pendingRawZoom > 1.01 {
-            image = centerCrop(image, factor: pendingRawZoom)
+        if crop > 1.01 {
+            image = centerCrop(image, factor: crop)
         }
 
-        // CPU で Apple Log 符号化（式どおりの値になる）。統計はステータスに出して検証に使う。
-        guard let encoded = AppleLog.encodeOnCPU(linearSRGB: image, context: rawConvertContext,
-                                                 sixteenBit: format == .tiff) else { return nil }
+        // Apple Log 符号化（式どおりの値になる）。統計はステータスに出して検証に使う。
+        // 前面では GPU で計算する（48MP で CPU の数倍速い）。バックグラウンドでは GPU が使えないので
+        // CPU で描く。GPU の途中でバックグラウンドに入って描けなかったときも CPU でやり直す。
+        let sixteenBit = format == .tiff
+        var encoded: AppleLog.Encoded? = nil
+        if !appInBackground {
+            encoded = AppleLog.encodeOnGPU(linearSRGB: image, context: rawConvertContext,
+                                           sixteenBit: sixteenBit)
+            lastRawLogPath = "GPU"
+        }
+        if encoded == nil {
+            let background = appInBackground
+            encoded = AppleLog.encodeOnCPU(linearSRGB: image,
+                                           context: background ? rawConvertSoftwareContext : rawConvertContext,
+                                           sixteenBit: sixteenBit)
+            lastRawLogPath = background ? "CPU（バックグラウンド）" : "CPU"
+        }
+        guard let encoded else { return nil }
         lastRawLogStats = L("status.rawStats",
                                  encoded.black, encoded.median, encoded.white)
         // LUT を焼き込まないなら CGImage を直接書き出す（48MP で余計なコピーを作らない）
         guard let lut = savedLUT else {
-            return AppleLog.fileData(from: encoded.image, tiff: format == .tiff)
+            return AppleLog.fileData(from: encoded.image, tiff: sixteenBit)
         }
         let logImage = applyLUT(to: CIImage(cgImage: encoded.image), entry: lut)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        let lutContext = appInBackground ? rawSoftwareContext : rawContext
         switch format {
         case .jpeg:
-            return rawContext.jpegRepresentation(of: logImage, colorSpace: colorSpace)
+            return lutContext.jpegRepresentation(of: logImage, colorSpace: colorSpace)
         case .tiff:
-            return rawContext.tiffRepresentation(of: logImage, format: .RGBA16,
+            return lutContext.tiffRepresentation(of: logImage, format: .RGBA16,
                                                  colorSpace: colorSpace)
         }
     }
@@ -1599,29 +1884,78 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         }
     }
 
+    /// これ以上の大きさは一時ファイル経由で写真へ渡す。メモリのまま渡すと、48MP の TIFF（約 290MB）は
+    /// PHPhotosErrorDomain 3301 で毎回のように保存に失敗していた（70MB の DNG・73MB の TIFF は成功）。
+    private static let saveViaFileThreshold = 50_000_000
+
+    /// onFinish: 保存が終わったら（失敗も含めて）呼ばれる。
     private func savePhotoData(_ data: Data,
                                uniformTypeIdentifier: String? = nil,
-                               completion message: String) {
+                               completion message: String,
+                               onFinish: (() -> Void)? = nil) {
+        let formatName = Self.imageFormatName(of: data)
+        let sizeKB = data.count / 1000
+        let fileURL = data.count >= Self.saveViaFileThreshold
+            ? Self.writeTemporaryFile(data, formatName: formatName) : nil
+        let payload: Data? = fileURL == nil ? data : nil // ファイルに書けたらメモリの方は手放す
+        let via = fileURL == nil ? "memory" : "file"
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
             guard status == .authorized || status == .limited else {
                 dlog("save", "写真ライブラリの権限なし status=\(status.rawValue)")
+                if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
                 self?.setStatus(L("status.photosDenied"))
+                onFinish?()
                 return
             }
             PHPhotoLibrary.shared().performChanges {
                 let request = PHAssetCreationRequest.forAsset()
                 let options = PHAssetResourceCreationOptions()
                 options.uniformTypeIdentifier = uniformTypeIdentifier
-                request.addResource(with: .photo, data: data, options: options)
+                if let fileURL {
+                    options.shouldMoveFile = true // コピーを作らず写真ライブラリへ移す
+                    request.addResource(with: .photo, fileURL: fileURL, options: options)
+                } else if let payload {
+                    request.addResource(with: .photo, data: payload, options: options)
+                }
             } completionHandler: { ok, error in
+                // 移されずに残った一時ファイル（失敗時など）は消す
+                if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
                 if ok {
-                    dlog("save", "保存OK size=\(data.count / 1000)KB type=\(uniformTypeIdentifier ?? "-")")
+                    dlog("save", "保存OK format=\(formatName) size=\(sizeKB)KB via=\(via) type=\(uniformTypeIdentifier ?? "-")")
                 } else {
                     let ns = error as NSError?
-                    dlog("save", "保存失敗 domain=\(ns?.domain ?? "?") code=\(ns?.code ?? 0) \(error?.localizedDescription ?? "")")
+                    dlog("save", "保存失敗 format=\(formatName) size=\(sizeKB)KB via=\(via) domain=\(ns?.domain ?? "?") code=\(ns?.code ?? 0) \(error?.localizedDescription ?? "")")
                 }
                 self?.setStatus(ok ? message : L("status.saveFailed"))
+                onFinish?()
             }
+        }
+    }
+
+    /// 保存用の一時ファイルを書く。失敗したら nil（メモリから保存する）。
+    private static func writeTemporaryFile(_ data: Data, formatName: String) -> URL? {
+        let ext = ["JPEG": "jpg", "TIFF": "tif", "HEIC": "heic", "DNG": "dng"][formatName] ?? "dat"
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("save-\(UUID().uuidString).\(ext)")
+        do {
+            try data.write(to: url)
+            return url
+        } catch {
+            dlog("save", "一時ファイルへの書き込みに失敗（メモリから保存する） \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// 保存データの実際の形式をログ用に返す。ヘッダーを見るだけで画像全体はデコードしない。
+    private static func imageFormatName(of data: Data) -> String {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let type = CGImageSourceGetType(source) as String? else { return "?" }
+        switch type {
+        case "public.jpeg": return "JPEG"
+        case "public.tiff": return "TIFF"
+        case "public.heic": return "HEIC"
+        case "com.adobe.raw-image", "com.adobe.dng": return "DNG"
+        default: return type
         }
     }
 
@@ -1641,13 +1975,16 @@ extension LogPhotoCamera: AVCaptureVideoDataOutputSampleBufferDelegate {
         bufferLock.lock()
         latestBuffer = buffer
         bufferLock.unlock()
-        // フレームサイズの変化だけを公開する（タップAFの座標変換に使う）
+        // フレームサイズと画素形式の変化だけを公開する（タップAFの座標変換と検証表示に使う）
         let w = CVPixelBufferGetWidth(buffer)
         let h = CVPixelBufferGetHeight(buffer)
-        if w != lastFrameWidth || h != lastFrameHeight {
+        let pixelFormat = CVPixelBufferGetPixelFormatType(buffer)
+        if w != lastFrameWidth || h != lastFrameHeight || pixelFormat != lastFramePixelFormat {
             lastFrameWidth = w
             lastFrameHeight = h
-            let code = fourCharCode(CVPixelBufferGetPixelFormatType(buffer))
+            lastFramePixelFormat = pixelFormat
+            let code = fourCharCode(pixelFormat)
+            dlog("session", "フレーム受信 \(code) \(w)x\(h)")
             DispatchQueue.main.async {
                 self.previewFrameSize = CGSize(width: w, height: h)
                 self.frameFormatCode = code
@@ -1662,26 +1999,39 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
                      didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
         markRawStage("4 結果受信")
+        rawCropLock.lock()
+        let crop = rawCropByCaptureID.removeValue(forKey: photo.resolvedSettings.uniqueID) ?? 1
+        let requestedDims = rawRequestedDimsByCaptureID.removeValue(forKey: photo.resolvedSettings.uniqueID)
+        rawCropLock.unlock()
         if let error {
             let ns = error as NSError
             dlog("raw", "撮影エラー domain=\(ns.domain) code=\(ns.code) \(error.localizedDescription) device=\(captureDevice?.localizedName ?? "nil") mode=\(mode.rawValue)")
             markRawStage(nil)
             setStatus(L("status.rawFailed", error.localizedDescription))
+            backgroundWorkFinished()
             return
         }
         guard let data = photo.fileDataRepresentation() else {
             dlog("raw", "結果受信したが fileDataRepresentation が nil isRaw=\(photo.isRawPhoto)")
             markRawStage(nil)
             setStatus(L("status.rawNoData"))
+            backgroundWorkFinished()
             return
         }
-        dlog("raw", "結果受信 isRaw=\(photo.isRawPhoto) size=\(data.count / 1000)KB device=\(captureDevice?.localizedName ?? "nil")")
+        let rawDims = photo.resolvedSettings.rawPhotoDimensions
+        dlog("raw", "結果受信 isRaw=\(photo.isRawPhoto) raw=\(rawDims.width)x\(rawDims.height) size=\(data.count / 1000)KB device=\(captureDevice?.localizedName ?? "nil")")
+        if let requestedDims, Int(rawDims.width) * Int(rawDims.height) < Int(requestedDims.width) * Int(requestedDims.height) {
+            dlog("raw", "⚠︎ ProRAW が指定より小さい（指定 \(requestedDims.width)x\(requestedDims.height) → 実際 \(rawDims.width)x\(rawDims.height)）")
+        }
         if photo.isRawPhoto {
             // (1) DNG そのまま保存 (2) Log変換画像も保存
+            // 撮影時にもらった処理枠は DNG 保存で返し、変換はもう 1 枠もらう（先に増やして 0 にしない）
+            backgroundWorkStarted()
             markRawStage("5 DNG 保存（\(data.count / 1_000_000)MB）")
             savePhotoData(data,
                           uniformTypeIdentifier: "com.adobe.raw-image",
-                          completion: L("status.dngSaved"))
+                          completion: L("status.dngSaved"),
+                          onFinish: { [weak self] in self?.backgroundWorkFinished() })
             updateThumbnail(from: data)
             setStatus(L("status.dngConverting"))
             markRawStage("6 Log 変換開始（\(data.count / 1_000_000)MB）")
@@ -1690,16 +2040,19 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
             rawConversionQueue.async { [weak self] in
                 guard let self else { return }
                 autoreleasepool {
-                    if let converted = self.makeLogImageData(fromDNG: data, format: format) {
-                        dlog("raw", "Log 変換OK size=\(converted.count / 1000)KB \(self.lastRawLogStats)")
+                    let started = CACurrentMediaTime()
+                    if let converted = self.makeLogImageData(fromDNG: data, format: format, crop: crop) {
+                        dlog("raw", "Log 変換OK \(self.lastRawLogPath) \(String(format: "%.1f", CACurrentMediaTime() - started))秒 crop=\(String(format: "%.2f", crop)) size=\(converted.count / 1000)KB \(self.lastRawLogStats)")
                         self.markRawStage("7 変換画像の保存")
                         self.updateThumbnail(from: converted)
                         self.savePhotoData(converted, completion: (format == .tiff
                             ? L("status.logTiffSaved") : L("status.logJpegSaved"))
-                            + "（\(self.lastRawLogStats)）")
+                            + "（\(self.lastRawLogStats)）",
+                            onFinish: { self.backgroundWorkFinished() })
                     } else {
                         dlog("raw", "Log 変換に失敗（CIRAWFilter が nil か出力なし）")
                         self.setStatus(L("status.logConvertFailed"))
+                        self.backgroundWorkFinished()
                     }
                     self.markRawStage(nil)
                 }
@@ -1707,7 +2060,8 @@ extension LogPhotoCamera: AVCapturePhotoCaptureDelegate {
         } else {
             markRawStage(nil)
             updateThumbnail(from: data)
-            savePhotoData(data, completion: L("status.photoSaved"))
+            savePhotoData(data, completion: L("status.photoSaved"),
+                          onFinish: { [weak self] in self?.backgroundWorkFinished() })
         }
     }
 }

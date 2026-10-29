@@ -1,3 +1,4 @@
+import Accelerate
 import CoreImage
 import Foundation
 import ImageIO
@@ -236,6 +237,139 @@ enum AppleLog {
                                space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                bitmapInfo: CGBitmapInfo(rawValue: sixteenBit
                                    ? (CGImageAlphaInfo.none.rawValue | CGBitmapInfo.byteOrder16Big.rawValue)
+                                   : CGImageAlphaInfo.none.rawValue),
+                               provider: provider, decode: nil, shouldInterpolate: false,
+                               intent: .defaultIntent) else { return nil }
+        return Encoded(image: cg, black: black, median: median, white: white)
+    }
+
+    // MARK: - GPU 版（Core Image の Metal カーネル）
+    /// encode と同じ式（sRGB 原色のリニア → BT.2020 → Apple Log）を GPU で計算するカーネル。
+    /// ビルド設定を増やさないよう実行時に Metal ソースからコンパイルする。失敗したら nil（CPU 版を使う）。
+    /// 定数は CPU 版の Float 値をそのまま埋め込み、同じ値になるようにする。
+    static let gpuKernel: CIColorKernel? = {
+        func f(_ v: Float) -> String { "\(Double(v))f" }
+        let source = """
+        #include <CoreImage/CoreImage.h>
+        using namespace metal;
+
+        static float appleLogEncode1(float x) {
+            if (x >= \(f(Rt))) { return min(\(f(gamma)) * precise::log2(x + \(f(beta))) + \(f(delta)), 1.0f); }
+            if (x >= \(f(R0))) { float d = x - (\(f(R0))); return \(f(c)) * d * d; }
+            return 0.0f;
+        }
+
+        [[stitchable]] float4 appleLogEncode(coreimage::sample_t s) {
+            float3 rgb = s.rgb;
+            float3 bt2020 = float3(dot(float3(0.6274f, 0.3293f, 0.0433f), rgb),
+                                   dot(float3(0.0691f, 0.9195f, 0.0114f), rgb),
+                                   dot(float3(0.0164f, 0.0880f, 0.8956f), rgb));
+            return float4(appleLogEncode1(bt2020.r), appleLogEncode1(bt2020.g),
+                          appleLogEncode1(bt2020.b), 1.0f);
+        }
+        """
+        do {
+            let kernels = try CIKernel.kernels(withMetalString: source)
+            guard let kernel = kernels.first(where: { $0.name == "appleLogEncode" }) as? CIColorKernel else {
+                dlog("raw", "GPU カーネルが見つからない（CPU で変換） kernels=\(kernels.map { $0.name })")
+                return nil
+            }
+            dlog("raw", "GPU カーネル準備OK")
+            return kernel
+        } catch {
+            dlog("raw", "GPU カーネルのコンパイル失敗（CPU で変換） \(error.localizedDescription)")
+            return nil
+        }
+    }()
+
+    /// encodeOnCPU と同じ結果（BT.2020 原色の Apple Log、8bit / 16bit RGB の CGImage）を GPU で作る。
+    /// 帯ごとに RGBA で描いて RGB に詰める（出力の形式・大きさは CPU 版と同じ）。
+    /// 描けなかった帯（途中でバックグラウンドに入り GPU が止められた等）を見つけたら nil を返す。
+    static func encodeOnGPU(linearSRGB image: CIImage, context: CIContext,
+                            sixteenBit: Bool) -> Encoded? {
+        guard let kernel = gpuKernel else { return nil }
+        let extent = image.extent.integral
+        let width = Int(extent.width), height = Int(extent.height)
+        guard width > 0, height > 0,
+              let encodedImage = kernel.apply(extent: extent, arguments: [image]) else { return nil }
+        let bytesPerChannel = sixteenBit ? 2 : 1
+        let outRowBytes = width * 3 * bytesPerChannel
+        let stripRowBytes = width * 4 * bytesPerChannel
+        let stripRows = max(1, min(height, (64 * 1024 * 1024) / stripRowBytes)) // 1 帯 ≈ 64MB
+        // 出力は malloc で確保して Data へコピーせず渡す（48MP の 16bit で 290MB のコピーを省く）
+        guard let out = malloc(outRowBytes * height) else { return nil }
+        var handedOff = false
+        defer { if !handedOff { free(out) } }
+        var strip = [UInt8](repeating: 0, count: stripRowBytes * stripRows)
+        var samples: [Float] = []
+        samples.reserveCapacity(width * height / 256 + 1)
+        let scale: Float = sixteenBit ? 1.0 / 65535 : 1.0 / 255
+        var y0 = 0
+        while y0 < height {
+            let rows = min(stripRows, height - y0)
+            // CIImage の座標は下が原点。出力は上から詰めるので帯の位置を反転して取り出す。
+            let bounds = CGRect(x: extent.minX,
+                                y: extent.maxY - CGFloat(y0 + rows),
+                                width: CGFloat(width), height: CGFloat(rows))
+            var zeroSamples = 0, takenSamples = 0
+            strip.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!
+                // 描かれなかった部分を見分けるため 0 で埋めてから描く。カーネルはアルファを常に 1 で
+                // 返すので、描けた画素のアルファは最大値、描けなかった画素は 0 のまま残る。
+                memset(base, 0, stripRowBytes * rows)
+                // colorSpace: nil = 色変換なし（カーネルの出力＝ Log 符号値をそのまま書く）
+                context.render(encodedImage, toBitmap: base, rowBytes: stripRowBytes, bounds: bounds,
+                               format: sixteenBit ? .RGBA16 : .RGBA8, colorSpace: nil)
+                let count = width * rows
+                var i = 0
+                while i < count {
+                    let r, g, b, a: Float
+                    if sixteenBit {
+                        let p = base.assumingMemoryBound(to: UInt16.self)
+                        r = Float(p[i * 4]) * scale; g = Float(p[i * 4 + 1]) * scale
+                        b = Float(p[i * 4 + 2]) * scale; a = Float(p[i * 4 + 3])
+                    } else {
+                        let p = base.assumingMemoryBound(to: UInt8.self)
+                        r = Float(p[i * 4]) * scale; g = Float(p[i * 4 + 1]) * scale
+                        b = Float(p[i * 4 + 2]) * scale; a = Float(p[i * 4 + 3])
+                    }
+                    if a == 0 { zeroSamples += 1 }
+                    samples.append(0.2627 * r + 0.6780 * g + 0.0593 * b)
+                    takenSamples += 1
+                    i += 256
+                }
+                // RGBA → RGB に詰めて出力へ置く
+                var src = vImage_Buffer(data: base, height: vImagePixelCount(rows),
+                                        width: vImagePixelCount(width), rowBytes: stripRowBytes)
+                var dst = vImage_Buffer(data: out + y0 * outRowBytes, height: vImagePixelCount(rows),
+                                        width: vImagePixelCount(width), rowBytes: outRowBytes)
+                if sixteenBit {
+                    vImageConvert_RGBA16UtoRGB16U(&src, &dst, vImage_Flags(kvImageNoFlags))
+                } else {
+                    vImageConvert_RGBA8888toRGB888(&src, &dst, vImage_Flags(kvImageNoFlags))
+                }
+            }
+            if zeroSamples * 100 > takenSamples {
+                dlog("raw", "GPU で描けなかった帯あり（\(y0)行目〜 未描画の画素 \(zeroSamples)/\(takenSamples)）")
+                return nil
+            }
+            y0 += rows
+        }
+        strip = []
+        samples.sort()
+        let black = samples.isEmpty ? 0 : samples[samples.count / 100]
+        let median = samples.isEmpty ? 0 : samples[samples.count / 2]
+        let white = samples.isEmpty ? 0 : samples[samples.count * 99 / 100]
+        let data = Data(bytesNoCopy: out, count: outRowBytes * height, deallocator: .free)
+        handedOff = true
+        guard let provider = CGDataProvider(data: data as CFData),
+              let cg = CGImage(width: width, height: height,
+                               bitsPerComponent: sixteenBit ? 16 : 8,
+                               bitsPerPixel: sixteenBit ? 48 : 24,
+                               bytesPerRow: outRowBytes,
+                               space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                               bitmapInfo: CGBitmapInfo(rawValue: sixteenBit
+                                   ? (CGImageAlphaInfo.none.rawValue | CGBitmapInfo.byteOrder16Little.rawValue)
                                    : CGImageAlphaInfo.none.rawValue),
                                provider: provider, decode: nil, shouldInterpolate: false,
                                intent: .defaultIntent) else { return nil }
