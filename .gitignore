@@ -1,0 +1,15 @@
+# xcodegen で生成されるもの
+LogPhoto.xcodeproj/
+Info.plist
+
+# ビルド成果物・実機ログ
+build/
+logs/
+device.log
+
+# 個人の設定（Team ID / デバイス ID など）
+scripts/device.env
+
+# Xcode / macOS
+xcuserdata/
+.DS_Store
