@@ -20,8 +20,8 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleShortVersionString: "1.12"
-        CFBundleVersion: "22"
+        CFBundleShortVersionString: "1.13"
+        CFBundleVersion: "23"
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -32,6 +32,6 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.logphoto
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
-        MARKETING_VERSION: "1.12"
-        CURRENT_PROJECT_VERSION: "22"
+        MARKETING_VERSION: "1.13"
+        CURRENT_PROJECT_VERSION: "23"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

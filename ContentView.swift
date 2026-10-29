@@ -28,6 +28,9 @@ struct ContentView: View {
     @State private var showLUTImporter = false
     @State private var showLastPhoto = false
     @State private var shutterLog: Double = -6
+    @State private var showPresetDialog = false
+    @State private var presetDialogIndex: Int? = nil
+    @State private var presetDialogTitle = ""
 
     private var lutSelection: Binding<String> {
         Binding(get: { camera.selectedLUTName },
@@ -116,30 +119,47 @@ struct ContentView: View {
                     .background(.black.opacity(0.45), in: Capsule())
                     .padding(.bottom, 10)
 
-                if camera.manualMode {
-                    manualPanel
-                }
-
                 zoomControl
                     .padding(.bottom, 14)
 
                 bottomBar
             }
 
-            // 設定パネル: シートではなく、プレビューの上に透ける半透明パネルとして重ねる
-            if showPanel {
-                // シャッター列と歯車は隠さない（パネルはその上に浮かぶ）
-                VStack(spacing: 0) {
+            // 設定パネルとマニュアルバー: プレビューの上に透ける半透明パネルとして重ねる。
+            // マニュアルバーは設定パネルの上に積み、設定を閉じるとその位置まで下にスライドする。
+            // どちらも倍率チップとシャッター列は隠さない。
+            if showPanel || camera.manualMode {
+                VStack(spacing: 8) {
                     Spacer()
-                    settingsSheet
-                        .padding(.horizontal, 8)
-                        .padding(.bottom, 108)
+                    if camera.manualMode {
+                        manualPanel
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                    if showPanel {
+                        settingsSheet
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
                 }
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .padding(.horizontal, 8)
+                .padding(.bottom, 168)
                 .zIndex(2)
             }
         }
         .animation(.easeInOut(duration: 0.22), value: showPanel)
+        .animation(.easeInOut(duration: 0.22), value: camera.manualMode)
+        .confirmationDialog(presetDialogTitle, isPresented: $showPresetDialog, titleVisibility: .visible) {
+            if let i = presetDialogIndex {
+                Button(camera.manualPresets[i] == nil ? "保存" : "上書き保存") {
+                    camera.saveManualPreset(to: i)
+                }
+                if camera.manualPresets[i] != nil {
+                    Button("削除（空にする）", role: .destructive) {
+                        camera.deleteManualPreset(at: i)
+                    }
+                }
+                Button("キャンセル", role: .cancel) { }
+            }
+        }
         .task {
             await camera.requestAndStart()
         }
@@ -378,6 +398,10 @@ struct ContentView: View {
         }
         .padding(.horizontal, 14).padding(.vertical, 5)
         .background(.black.opacity(0.45), in: Capsule())
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            camera.setZoom(1.0, ramp: true, switchLensNow: true)
+            zoomLogUI = 0
+        })
     }
 
     private func revealZoomSlider() {
@@ -602,7 +626,7 @@ struct ContentView: View {
                     .font(.caption.bold())
                     .foregroundStyle(.white)
 
-                Slider(value: $exposureEV, in: -2...2, step: 0.1)
+                Slider(value: $exposureEV, in: camera.exposureRange, step: 0.1)
                     .tint(.white)
                     .onChange(of: exposureEV) { _, newValue in
                         camera.applyExposureCompensation(newValue)
@@ -611,7 +635,20 @@ struct ContentView: View {
                 Text(String(format: "%+.1f", exposureEV))
                     .font(.caption.monospacedDigit().bold())
                     .foregroundStyle(.white)
-                    .frame(width: 36, alignment: .trailing)
+                    .frame(width: 40, alignment: .trailing)
+            }
+            .simultaneousGesture(TapGesture(count: 2).onEnded { exposureEV = 0 })
+
+            // すべて初期値に戻す
+            Button {
+                resetAllSliders()
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "arrow.counterclockwise")
+                    Text("スライダーをすべて初期値に戻す（各行はダブルタップでも戻せる）")
+                }
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.85))
             }
 
             // 撮影モード切替（方式A / 方式B）と RAW の解像度
@@ -690,7 +727,39 @@ struct ContentView: View {
     // MARK: - マニュアルパネル
     private var manualPanel: some View {
         VStack(spacing: 2) {
-            manualRow(label: "SS", value: shutterLabel(camera.shutterSeconds)) {
+            // プリセット 5 枠: タップで呼び出し、長押しで保存 / 上書き / 削除
+            HStack(spacing: 6) {
+                Text("プリセット")
+                    .font(.caption2.bold())
+                    .foregroundStyle(.white.opacity(0.85))
+                ForEach(0..<5, id: \.self) { i in
+                    let saved = camera.manualPresets[i] != nil
+                    let active = camera.activePresetIndex == i
+                    Text("\(i + 1)")
+                        .font(.caption.bold().monospacedDigit())
+                        .foregroundStyle(active ? .black : (saved ? .white : .white.opacity(0.4)))
+                        .frame(width: 30, height: 26)
+                        .background(active ? Color.yellow : (saved ? Color.white.opacity(0.22) : Color.white.opacity(0.08)),
+                                    in: RoundedRectangle(cornerRadius: 7))
+                        .overlay(RoundedRectangle(cornerRadius: 7)
+                            .stroke(.white.opacity(saved ? 0.5 : 0.18), lineWidth: 1))
+                        .onTapGesture {
+                            if saved { camera.loadManualPreset(at: i) } else { openPresetDialog(i) }
+                        }
+                        .onLongPressGesture(minimumDuration: 0.45) {
+                            openPresetDialog(i)
+                        }
+                }
+                Spacer()
+                Text("長押しで保存")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+            .padding(.bottom, 2)
+
+            manualRow(label: "SS", value: shutterLabel(camera.shutterSeconds), onReset: {
+                shutterLog = log2(1.0 / 60)
+            }) {
                 Slider(value: $shutterLog,
                        in: log2(camera.shutterRange.lowerBound)...log2(camera.shutterRange.upperBound),
                        step: 0.05)
@@ -698,38 +767,71 @@ struct ContentView: View {
                     .onChange(of: shutterLog) { _, newValue in
                         camera.shutterSeconds = pow(2.0, newValue)
                         camera.updateManualExposure()
+                        camera.manualValueEdited()
                     }
             }
-            manualRow(label: "ISO", value: "\(Int(camera.isoValue))") {
+            manualRow(label: "ISO", value: "\(Int(camera.isoValue))", onReset: {
+                camera.isoValue = min(max(100, camera.isoRange.lowerBound), camera.isoRange.upperBound)
+            }) {
                 Slider(value: $camera.isoValue, in: camera.isoRange, step: 1)
                     .tint(.white)
                     .onChange(of: camera.isoValue) { _, _ in
                         camera.updateManualExposure()
+                        camera.manualValueEdited()
                     }
             }
-            manualRow(label: "焦点", value: focusLabel(camera.focusPosition)) {
+            manualRow(label: "焦点", value: focusLabel(camera.focusPosition), onReset: {
+                camera.focusPosition = 0.5
+            }) {
                 Slider(value: $camera.focusPosition, in: 0...1, step: 0.01)
                     .tint(.white)
                     .onChange(of: camera.focusPosition) { _, _ in
                         camera.updateManualFocus()
+                        camera.manualValueEdited()
                     }
             }
-            manualRow(label: "WB", value: "\(Int(camera.whiteBalanceKelvin))K") {
+            manualRow(label: "WB", value: "\(Int(camera.whiteBalanceKelvin))K", onReset: {
+                camera.whiteBalanceKelvin = 5200
+            }) {
                 Slider(value: $camera.whiteBalanceKelvin, in: 2500...8000, step: 50)
                     .tint(.white)
                     .onChange(of: camera.whiteBalanceKelvin) { _, _ in
                         camera.updateManualWhiteBalance()
+                        camera.manualValueEdited()
                     }
             }
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 6)
-        .background(.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
-        .padding(.horizontal, 16)
-        .padding(.bottom, 8)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(.ultraThinMaterial)
+        .background(Color.black.opacity(0.22))
+        .clipShape(RoundedRectangle(cornerRadius: 22))
+        .overlay(RoundedRectangle(cornerRadius: 22).stroke(.white.opacity(0.12), lineWidth: 1))
+    }
+
+    private func openPresetDialog(_ index: Int) {
+        presetDialogIndex = index
+        presetDialogTitle = camera.manualPresets[index] == nil
+            ? "プリセット \(index + 1) に現在の設定を保存しますか？"
+            : "プリセット \(index + 1) は保存済みです。上書きしますか？"
+        showPresetDialog = true
+    }
+
+    /// 露出 / ズーム / SS / ISO / 焦点 / WB をすべて初期値へ。
+    private func resetAllSliders() {
+        exposureEV = 0
+        camera.setZoom(1.0, ramp: true, switchLensNow: true)
+        zoomLogUI = 0
+        shutterLog = log2(1.0 / 60)
+        camera.isoValue = min(max(100, camera.isoRange.lowerBound), camera.isoRange.upperBound)
+        camera.focusPosition = 0.5
+        camera.whiteBalanceKelvin = 5200
+        camera.manualValueEdited()
     }
 
     private func manualRow<Control: View>(label: String, value: String,
+                                          onReset: @escaping () -> Void,
                                           @ViewBuilder control: () -> Control) -> some View {
         HStack(spacing: 8) {
             Text(label)
@@ -743,6 +845,7 @@ struct ContentView: View {
                 .foregroundStyle(.white)
                 .frame(width: 50, alignment: .trailing)
         }
+        .simultaneousGesture(TapGesture(count: 2).onEnded { onReset() })
     }
 
     private func shutterLabel(_ seconds: Double) -> String {
@@ -771,6 +874,12 @@ private struct RuleOfThirdsGrid: View {
                 }
             }
             .stroke(.white.opacity(0.35), lineWidth: 1)
+            // 中央の縦線（既定で表示）
+            Path { path in
+                path.move(to: CGPoint(x: geometry.size.width / 2, y: 0))
+                path.addLine(to: CGPoint(x: geometry.size.width / 2, y: geometry.size.height))
+            }
+            .stroke(.white.opacity(0.6), lineWidth: 1)
         }
         .allowsHitTesting(false)
     }

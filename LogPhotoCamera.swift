@@ -92,6 +92,18 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     @Published var whiteBalanceKelvin: Double = 5200
     @Published var isoRange: ClosedRange<Double> = 50...1600
     @Published var shutterRange: ClosedRange<Double> = (1.0 / 8000)...1.0
+    /// 露出補正の可動範囲（端末の min/maxExposureTargetBias。16 Pro は概ね ±8EV）
+    @Published var exposureRange: ClosedRange<Double> = -2...2
+    @Published var exposureBias: Double = 0
+    /// マニュアル設定のプリセット 5 枠（nil = 空）
+    struct ManualPreset: Codable, Equatable {
+        var shutterSeconds: Double
+        var isoValue: Double
+        var focusPosition: Double
+        var whiteBalanceKelvin: Double
+    }
+    @Published var manualPresets: [ManualPreset?] = LogPhotoCamera.loadPresets()
+    @Published var activePresetIndex: Int? = nil
 
     /// シャッター音（Logフレームはアプリが鳴らす音、RAW はシステムの音を抑制できる機種のみ）
     @Published var shutterSoundEnabled: Bool = UserDefaults.standard.object(forKey: "logphoto.shutterSound") as? Bool ?? true
@@ -434,16 +446,24 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let isoHi = Double(rangeFormat.maxISO)
         let ssLo = rangeFormat.minExposureDuration.seconds
         let ssHi = min(rangeFormat.maxExposureDuration.seconds, 2.0)
-        let currentISO = Double(device.iso)
-        let currentSS = device.exposureDuration.seconds
+        // マニュアル中はユーザーの値を維持し（新レンズの範囲にクランプ）、
+        // オート中だけデバイスの現在値をスライダーに反映する
+        let keepManual = manualMode
+        let currentISO = keepManual ? isoValue : Double(device.iso)
+        let currentSS = keepManual ? shutterSeconds : device.exposureDuration.seconds
         let logActive = device.activeColorSpace == .appleLog
         installFocusObservation(for: device)
+        scheduleTelephotoNearCheck(for: device)
         let lensName = lensLabel(for: device)
             + (teleTooClose && device.deviceType == .builtInWideAngleCamera ? "（近距離クロップ）" : "")
+        let biasLo = Double(device.minExposureTargetBias)
+        let biasHi = Double(device.maxExposureTargetBias)
+        reapplyExposureBias(device)
         DispatchQueue.main.async {
-            self.focusStatus = "AF 自動"
+            self.focusStatus = keepManual ? "MF" : "AF 自動"
             if isoHi > isoLo { self.isoRange = isoLo...isoHi }
             if ssHi > ssLo { self.shutterRange = ssLo...ssHi }
+            if biasHi > biasLo { self.exposureRange = biasLo...biasHi }
             self.isoValue = min(max(currentISO, isoLo), isoHi)
             self.shutterSeconds = min(max(currentSS, ssLo), ssHi)
             self.appleLogAvailable = hasLogFormat
@@ -499,24 +519,42 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             guard let self, change.newValue == false else { return }
             let position = dev.lensPosition
             self.sessionQueue.async { [weak self] in
-                guard let self, self.captureDevice == dev, !self.manualMode, !self.teleTooClose else { return }
-                if position < 0.03 {
-                    self.teleTooClose = true
-                    self.teleRetryAt = Date().addingTimeInterval(3)
-                    self.setStatus("望遠の最短距離より近いので広角のクロップに切り替えました")
-                    self.reconcileInput()
-                }
+                self?.handleTelephotoLensPosition(position, device: dev)
             }
+        }
+    }
+
+    /// 望遠へ切り替えた直後にも AF の結果を確認する（KVO が来ないケースの保険）。
+    private func scheduleTelephotoNearCheck(for device: AVCaptureDevice) {
+        guard device.deviceType == .builtInTelephotoCamera, !manualMode else { return }
+        for delay in [0.6, 1.2] {
+            sessionQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.captureDevice == device else { return }
+                self.handleTelephotoLensPosition(device.lensPosition, device: device)
+            }
+        }
+    }
+
+    /// 望遠の AF がレンズの最短端（lensPosition ≈ 0）で止まっている = 被写体が最短撮影距離より
+    /// 近い。純正と同じく広角の 5x クロップへ逃がす（sessionQueue 上）。
+    private func handleTelephotoLensPosition(_ position: Float, device: AVCaptureDevice) {
+        guard captureDevice == device, device.deviceType == .builtInTelephotoCamera,
+              !manualMode, !teleTooClose, !device.isAdjustingFocus else { return }
+        if position < 0.06 {
+            teleTooClose = true
+            teleRetryAt = Date().addingTimeInterval(5)
+            setStatus("望遠の最短距離より近いので広角のクロップに切り替えました")
+            reconcileInput()
         }
     }
 
     /// 広角クロップへ逃げている間にシーンが変わったら、望遠へ戻せるか試す。
     private func retryTelephotoIfNeeded() {
-        guard teleTooClose, Date() >= teleRetryAt, teleRetryCount < 2,
+        guard teleTooClose, Date() >= teleRetryAt, teleRetryCount < 1,
               let tele = teleDevice, desiredZoom >= zoomScale(for: tele) else { return }
         teleTooClose = false
         teleRetryCount += 1
-        teleRetryAt = Date().addingTimeInterval(4)
+        teleRetryAt = Date().addingTimeInterval(8)
         reconcileInput()
     }
 
@@ -714,16 +752,23 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     // MARK: - 露出補正
     /// 露出ターゲットバイアス。lockForConfiguration で囲んで安全に適用する。
     func applyExposureCompensation(_ ev: Double) {
+        exposureBias = ev
         sessionQueue.async { [weak self] in
             guard let self, let device = self.captureDevice else { return }
-            do {
-                try device.lockForConfiguration()
-                let clamped = max(Double(device.minExposureTargetBias),
-                                  min(Double(device.maxExposureTargetBias), ev))
-                device.setExposureTargetBias(Float(clamped), completionHandler: nil)
-                device.unlockForConfiguration()
-            } catch { }
+            self.reapplyExposureBias(device)
         }
+    }
+
+    /// レンズ切替後にも露出補正を掛け直す（sessionQueue 上）。
+    private func reapplyExposureBias(_ device: AVCaptureDevice) {
+        let ev = exposureBias
+        do {
+            try device.lockForConfiguration()
+            let clamped = max(Double(device.minExposureTargetBias),
+                              min(Double(device.maxExposureTargetBias), ev))
+            device.setExposureTargetBias(Float(clamped), completionHandler: nil)
+            device.unlockForConfiguration()
+        } catch { }
     }
 
     // MARK: - マニュアル撮影（実カメラでのみ使う）
@@ -756,8 +801,12 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     private func applyManualSettings() {
         guard let device = captureDevice else { return }
-        let seconds = min(max(shutterSeconds, shutterRange.lowerBound), shutterRange.upperBound)
-        let iso = Float(min(max(isoValue, isoRange.lowerBound), isoRange.upperBound))
+        // 範囲は切替先レンズのフォーマットから取る（公開中の範囲は前のレンズのものかもしれない）
+        let format = device.activeFormat
+        let ssLo = format.minExposureDuration.seconds
+        let ssHi = min(format.maxExposureDuration.seconds, 2.0)
+        let seconds = min(max(shutterSeconds, ssLo), ssHi)
+        let iso = Float(min(max(isoValue, Double(format.minISO)), Double(format.maxISO)))
         do {
             try device.lockForConfiguration()
             if device.isExposureModeSupported(.custom) {
@@ -782,6 +831,74 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             }
             device.unlockForConfiguration()
         } catch { }
+    }
+
+    // MARK: - マニュアルプリセット（5 枠、上書き・削除可）
+    private static let presetsKey = "logphoto.manualPresets"
+
+    private static func loadPresets() -> [ManualPreset?] {
+        var slots: [ManualPreset?] = Array(repeating: nil, count: 5)
+        if let data = UserDefaults.standard.data(forKey: presetsKey),
+           let decoded = try? JSONDecoder().decode([ManualPreset?].self, from: data) {
+            for (i, p) in decoded.prefix(5).enumerated() { slots[i] = p }
+        }
+        return slots
+    }
+
+    private func persistPresets() {
+        if let data = try? JSONEncoder().encode(manualPresets) {
+            UserDefaults.standard.set(data, forKey: Self.presetsKey)
+        }
+    }
+
+    func currentManualPreset() -> ManualPreset {
+        ManualPreset(shutterSeconds: shutterSeconds, isoValue: isoValue,
+                     focusPosition: focusPosition, whiteBalanceKelvin: whiteBalanceKelvin)
+    }
+
+    /// 現在値をスロットへ保存（既存があれば上書き）。
+    func saveManualPreset(to index: Int) {
+        guard manualPresets.indices.contains(index) else { return }
+        manualPresets[index] = currentManualPreset()
+        activePresetIndex = index
+        persistPresets()
+        setStatus("プリセット \(index + 1) に保存しました")
+    }
+
+    func deleteManualPreset(at index: Int) {
+        guard manualPresets.indices.contains(index) else { return }
+        manualPresets[index] = nil
+        if activePresetIndex == index { activePresetIndex = nil }
+        persistPresets()
+        setStatus("プリセット \(index + 1) を削除しました")
+    }
+
+    /// スロットを呼び出してカメラに適用する（マニュアルが OFF なら ON にする）。
+    func loadManualPreset(at index: Int) {
+        guard manualPresets.indices.contains(index), let preset = manualPresets[index] else { return }
+        shutterSeconds = preset.shutterSeconds
+        isoValue = preset.isoValue
+        focusPosition = preset.focusPosition
+        whiteBalanceKelvin = preset.whiteBalanceKelvin
+        activePresetIndex = index
+        if !manualMode {
+            setManualMode(true)
+        } else {
+            sessionQueue.async { [weak self] in self?.applyManualSettings() }
+        }
+        setStatus("プリセット \(index + 1) を呼び出しました")
+    }
+
+    /// 値を手で変えたら「呼び出し中」の強調を外す（UI から呼ぶ）。
+    func manualValueEdited() {
+        guard let i = activePresetIndex, let p = manualPresets[i] else { return }
+        let c = currentManualPreset()
+        // SS は log2 経由で丸めが入るので、わずかな差は「同じ」とみなす
+        let same = abs(log2(max(p.shutterSeconds, 1e-6)) - log2(max(c.shutterSeconds, 1e-6))) < 0.03
+            && abs(p.isoValue - c.isoValue) < 1
+            && abs(p.focusPosition - c.focusPosition) < 0.011
+            && abs(p.whiteBalanceKelvin - c.whiteBalanceKelvin) < 51
+        if !same { activePresetIndex = nil }
     }
 
     func updateManualExposure() {
@@ -875,6 +992,10 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         guard let request else { return }
         desiredZoom = min(max(request.factor, zoomLower), zoomUpper)
         if let tele = teleDevice, desiredZoom < zoomScale(for: tele) {
+            teleTooClose = false
+            teleRetryCount = 0
+        } else if request.switchLensNow {
+            // 5x チップを押し直したときは望遠をもう一度試す
             teleTooClose = false
             teleRetryCount = 0
         }
