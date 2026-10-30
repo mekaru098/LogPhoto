@@ -130,6 +130,14 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     /// シャッター音（Logフレームはアプリが鳴らす音、RAW はシステムの音を抑制できる機種のみ）
     @Published var shutterSoundEnabled: Bool = UserDefaults.standard.object(forKey: "logphoto.shutterSound") as? Bool ?? true
+    /// RAW 撮影（システムのシャッター音）を無音にできる機種か。日本など一部の国の機種は false で、
+    /// RAW+Log では音を消せない（Log フレームはアプリが鳴らしているので消せる）。
+    @Published var shutterSoundSuppressionSupported = false
+    @Published var torchOn = false            // ライト（常時点灯）。起動時は常にオフ
+    @Published var torchAvailable = false     // 現在のレンズでライトが使えるか（過熱時などは false になる）
+    private var torchObservation: NSKeyValueObservation?  // 実際の点灯状態（isTorchActive）の監視
+    private var torchAvailabilityObservation: NSKeyValueObservation?  // 使えるか（isTorchAvailable）の監視
+    private var torchRetryCount = 0                       // iOS に消されたときの点け直し回数（sessionQueue 上）
     /// 前回 RAW 撮影中に落ちた場合、その段階（クラッシュ原因の切り分け用）
     @Published var lastCrashStage: String? = nil
 
@@ -253,6 +261,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                 dlog("session", "中断後に停止していたため startRunning")
                 self.session.startRunning()
             }
+            // 中断（バックグラウンドなど）で iOS がライトを消すので、戻ったら設定どおりに点け直す
+            // （消されたあとも torchMode は .on のままのことがあるので force）
+            if let device = self.captureDevice { self.applyTorch(to: device, force: true) }
         }
     }
 
@@ -423,6 +434,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         // 設定側で .quality を指定するには出力側の上限を先に上げておく（超えると例外）
         photoOutput.maxPhotoQualityPrioritization = .quality
         session.commitConfiguration()
+        let suppressible = photoOutput.isShutterSoundSuppressionSupported
+        dlog("session", "RAW 撮影のシャッター音を消せる機種か: \(suppressible)")
+        DispatchQueue.main.async { self.shutterSoundSuppressionSupported = suppressible }
 
         applyVideoRotation()
         applyDeviceConfiguration(device)
@@ -598,6 +612,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         dlog("lens", "レンズ方式 → \(mode.rawValue)")
         lensSelectionMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: "logphoto.lensMode")
+        setStatus(L(mode == .auto ? "status.lensAuto" : "status.lensManual"))
         sessionQueue.async { [weak self] in
             guard let self else { return }
             self.teleTooClose = false
@@ -763,6 +778,16 @@ final class LogPhotoCamera: NSObject, ObservableObject {
            (try? device.lockForConfiguration()) != nil {
             device.activeColorSpace = .appleLog
             device.unlockForConfiguration()
+        }
+        // ライトはデバイスごとの設定なので、レンズを替えたら点け直す（消されたら監視で点け直す）
+        installTorchObservation(for: device)
+        applyTorch(to: device)
+        // 監視のどちらにも引っかからず点いていないとき（設定が無視された等）の保険
+        sessionQueue.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self, self.captureDevice == device, self.torchOn,
+                  device.hasTorch, device.isTorchAvailable, !device.isTorchActive else { return }
+            dlog("device", "切替後にライトが点いていないので点け直す")
+            self.applyTorch(to: device, force: true)
         }
         // レンズを切り替えた直後は AF/AE を明示的に連続オートへ（望遠で AF が動かない対策）
         if !manualMode {
@@ -1134,6 +1159,9 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     /// モード切替時に UI から呼ばれる。
     func modeChanged() {
         dlog("mode", "モード切替 → \(mode.rawValue)")
+        if mode == .rawLog, !shutterSoundEnabled, !shutterSoundSuppressionSupported {
+            setStatus(L("status.shutterSoundForced")) // 音を切っていても RAW では鳴ることを先に伝える
+        }
         sessionQueue.async { [weak self] in
             self?.reconcileInput()
         }
@@ -1601,6 +1629,88 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     func setShutterSound(_ on: Bool) {
         shutterSoundEnabled = on
         UserDefaults.standard.set(on, forKey: "logphoto.shutterSound")
+        dlog("device", "シャッター音 → \(on ? "ON" : "OFF") mode=\(mode.rawValue) rawSuppressible=\(shutterSoundSuppressionSupported)")
+        if !on, mode == .rawLog, !shutterSoundSuppressionSupported {
+            setStatus(L("status.shutterSoundForced"))
+        }
+    }
+
+    // MARK: - ライト（トーチ）
+    /// ライトのオン/オフ。フラッシュではなく常時点灯（Log フレームは映像の 1 コマなのでフラッシュは使えない）。
+    func setTorch(_ on: Bool) {
+        torchOn = on
+        dlog("device", "ライト → \(on ? "ON" : "OFF")")
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else { return }
+            self.torchRetryCount = 0
+            self.applyTorch(to: device)
+            if on, !(device.hasTorch && device.isTorchAvailable) {
+                self.setStatus(L("status.torchUnavailable"))
+            } else {
+                self.setStatus(L(on ? "status.torchOn" : "status.torchOff"))
+            }
+        }
+    }
+
+    /// 現在の設定（torchOn）をデバイスへ反映する（sessionQueue 上）。
+    /// レンズを替えると新しいデバイスはライトがオフなので、切替のたびに呼んで点け直す。
+    /// force: torchMode の値が同じでも設定し直す（iOS が消したあとは torchMode が .on のまま
+    /// isTorchActive だけ false になることがあるため）。
+    private func applyTorch(to device: AVCaptureDevice, force: Bool = false) {
+        let available = device.hasTorch && device.isTorchAvailable
+        DispatchQueue.main.async { self.torchAvailable = available }
+        guard device.hasTorch else { return }
+        let wanted: AVCaptureDevice.TorchMode = (torchOn && available) ? .on : .off
+        guard force || device.torchMode != wanted else { return }
+        do {
+            try device.lockForConfiguration()
+            device.torchMode = wanted
+            device.unlockForConfiguration()
+            dlog("device", "ライト設定 torchMode=\(wanted == .on ? "on" : "off") active=\(device.isTorchActive) available=\(available) zoom=\(String(format: "%.2f", device.videoZoomFactor)) device=\(device.localizedName)")
+        } catch {
+            dlog("device", "ライトの設定に失敗 device=\(device.localizedName) \(error.localizedDescription)")
+        }
+    }
+
+    /// 実際の点灯状態を監視する。点けているつもりなのに iOS が消したら（レンズ切替や倍率変更の直後に
+    /// 起きる）、少し待って点け直す。過熱などで使えなくなったとき（isTorchAvailable=false）は点け直さない。
+    private func installTorchObservation(for device: AVCaptureDevice) {
+        torchObservation = nil
+        torchAvailabilityObservation = nil
+        torchRetryCount = 0
+        guard device.hasTorch else { return }
+        // レンズを替えた直後は新しいデバイスの isTorchAvailable が一瞬 false で、そのとき点けようとしても
+        // 無視される（実測: 切替のたびに消えた）。使えるようになった時点で点け直す。
+        torchAvailabilityObservation = device.observe(\.isTorchAvailable, options: [.new]) { [weak self] dev, change in
+            guard let self, let available = change.newValue else { return }
+            self.sessionQueue.async { [weak self] in
+                guard let self, self.captureDevice == dev else { return }
+                dlog("device", "ライトを使えるか → \(available) 設定=\(self.torchOn ? "ON" : "OFF") active=\(dev.isTorchActive)")
+                DispatchQueue.main.async { self.torchAvailable = available }
+                if available, self.torchOn, !dev.isTorchActive {
+                    self.applyTorch(to: dev, force: true)
+                }
+            }
+        }
+        torchObservation = device.observe(\.isTorchActive, options: [.new]) { [weak self] dev, change in
+            guard let self, let active = change.newValue else { return }
+            self.sessionQueue.async { [weak self] in
+                guard let self, self.captureDevice == dev else { return }
+                dlog("device", "ライトの点灯状態 → \(active ? "点灯" : "消灯") 設定=\(self.torchOn ? "ON" : "OFF") available=\(dev.isTorchAvailable) zoom=\(String(format: "%.2f", dev.videoZoomFactor))")
+                if active {
+                    self.torchRetryCount = 0
+                    return
+                }
+                guard self.torchOn, dev.isTorchAvailable, self.torchRetryCount < 3 else { return }
+                self.torchRetryCount += 1
+                let attempt = self.torchRetryCount
+                self.sessionQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                    guard let self, self.captureDevice == dev, self.torchOn, !dev.isTorchActive else { return }
+                    dlog("device", "iOS に消されたライトを点け直す（\(attempt) 回目）")
+                    self.applyTorch(to: dev, force: true)
+                }
+            }
+        }
     }
 
     /// RAW 撮影の進行段階を UserDefaults に残す（落ちたときの切り分け用）。

@@ -32,6 +32,7 @@ struct ContentView: View {
     @State private var presetDialogIndex: Int? = nil
     @State private var presetDialogTitle = ""
     @State private var showAdvanced = false
+    @State private var manualCollapsed = false   // マニュアルパネルを 1 行の要約に折りたたむ
 
     private var lutSelection: Binding<String> {
         Binding(get: { camera.selectedLUTName },
@@ -113,12 +114,11 @@ struct ContentView: View {
                 }
                 Spacer()
 
-                Text(camera.statusText)
-                    .font(.footnote)
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12).padding(.vertical, 7)
-                    .background(.black.opacity(0.45), in: Capsule())
-                    .padding(.bottom, 10)
+                // パネルが出ているときは、パネルに隠れないようパネルの上に出す（下の overlay 側）
+                if !(showPanel || camera.manualMode) {
+                    statusCapsule
+                        .padding(.bottom, 10)
+                }
 
                 zoomControl
                     .padding(.bottom, 14)
@@ -132,6 +132,7 @@ struct ContentView: View {
             if showPanel || camera.manualMode {
                 VStack(spacing: 8) {
                     Spacer()
+                    statusCapsule // 「RAW 準備中」「保存しました」などがパネルで隠れないように
                     if camera.manualMode {
                         manualPanel
                             .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -168,7 +169,10 @@ struct ContentView: View {
             camera.stop()
         }
         .onChange(of: camera.manualMode) { _, isOn in
-            if isOn { shutterLog = log2(max(camera.shutterSeconds, 0.0001)) }
+            if isOn {
+                shutterLog = log2(max(camera.shutterSeconds, 0.0001))
+                manualCollapsed = false // 開いたときは必ず全部見える状態から
+            }
         }
         .onChange(of: camera.shutterSeconds) { _, newValue in
             // デバイス切替などでカメラ側の値が更新されたらスライダー位置も合わせる
@@ -212,6 +216,15 @@ struct ContentView: View {
         }
     }
 
+    /// 状態表示（「RAW 準備中」「保存しました」など）
+    private var statusCapsule: some View {
+        Text(camera.statusText)
+            .font(.footnote)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background(.black.opacity(0.45), in: Capsule())
+    }
+
     // MARK: - 上部
     private var topBar: some View {
         HStack(spacing: 8) {
@@ -234,7 +247,7 @@ struct ContentView: View {
                     .background(.ultraThinMaterial, in: Capsule())
             }
             Spacer()
-            // マクロとレンズ切替方式は、メニューを開かずに切り替えられるよう上部に置く
+            // マクロはメニューを開かずに切り替えられるよう上部に置く（レンズ切替のオート/マニュアルは倍率チップの右端）
             Button {
                 camera.setMacroMode(!camera.macroMode)
             } label: {
@@ -245,27 +258,30 @@ struct ContentView: View {
                     .background(camera.macroMode ? Color.white : Color.black.opacity(0.35),
                                 in: Capsule())
             }
-            Button {
-                camera.setLensSelectionMode(camera.lensSelectionMode == .auto ? .manual : .auto)
-            } label: {
-                Text(camera.lensSelectionMode == .auto ? L("settings.lensAuto") : L("settings.lensManual"))
-                    .font(.caption2.bold())
-                    .foregroundStyle(camera.lensSelectionMode == .manual ? .black : .white)
-                    .padding(.horizontal, 9).padding(.vertical, 5)
-                    .background(camera.lensSelectionMode == .manual ? Color.white : Color.black.opacity(0.35),
-                                in: Capsule())
-            }
             Text(camera.deviceName)
                 .font(.caption2)
                 .padding(.horizontal, 9).padding(.vertical, 5)
                 .background(.ultraThinMaterial, in: Capsule())
-            // シャッター音の ON/OFF
+            // ライト（常時点灯）の ON/OFF
+            Button {
+                camera.setTorch(!camera.torchOn)
+            } label: {
+                Image(systemName: camera.torchOn ? "flashlight.on.fill" : "flashlight.off.fill")
+                    .font(.caption)
+                    .foregroundStyle(camera.torchOn ? .yellow : .white)
+                    .frame(width: 30, height: 30)
+                    .background(.black.opacity(0.35), in: Circle())
+            }
+            .opacity(camera.torchAvailable ? 1 : 0.4)
+            // シャッター音の ON/OFF。RAW+Log で音を消せない機種では、OFF にしていても鳴ることを
+            // アイコンで示す（スピーカーに斜線なし・薄い黄色）
+            let soundForced = camera.mode == .rawLog && !camera.shutterSoundSuppressionSupported
             Button {
                 camera.setShutterSound(!camera.shutterSoundEnabled)
             } label: {
-                Image(systemName: camera.shutterSoundEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                Image(systemName: camera.shutterSoundEnabled || soundForced ? "speaker.wave.2.fill" : "speaker.slash.fill")
                     .font(.caption)
-                    .foregroundStyle(camera.shutterSoundEnabled ? .white : .yellow)
+                    .foregroundStyle(camera.shutterSoundEnabled ? .white : (soundForced ? .yellow.opacity(0.6) : .yellow))
                     .frame(width: 30, height: 30)
                     .background(.black.opacity(0.35), in: Circle())
             }
@@ -318,14 +334,39 @@ struct ContentView: View {
                 zoomSliderBar
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            if camera.lensSelectionMode == .manual {
-                lensChips
-            } else {
-                zoomChips
+            HStack(spacing: 8) {
+                if camera.lensSelectionMode == .manual {
+                    lensChips
+                } else {
+                    zoomChips
+                }
+                lensModeChip
             }
         }
         .padding(.horizontal, 24)
         .animation(.easeInOut(duration: 0.18), value: zoomSliderVisible)
+    }
+
+    /// レンズ切替の方式（オート: 倍率でレンズが自動で変わる / マニュアル: 選んだレンズに固定）。
+    /// 倍率チップの列の右端に置き、「この列の切り替え方」を変えるボタンだと分かるようにする。
+    private var lensModeChip: some View {
+        let manual = camera.lensSelectionMode == .manual
+        return Button {
+            camera.setLensSelectionMode(manual ? .auto : .manual)
+        } label: {
+            VStack(spacing: 1) {
+                Text(L("lens.modeLabel"))
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(manual ? .black.opacity(0.6) : .white.opacity(0.7))
+                Text(manual ? L("settings.lensManual") : L("settings.lensAuto"))
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(manual ? .black : .white)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 34)
+            .background(manual ? Color.white : Color.black.opacity(0.3), in: Capsule())
+        }
+        .buttonStyle(.plain)
     }
 
     /// 現在の倍率が属するプリセット（その倍率以下で最大のもの）。純正と同じ見せ方。
@@ -861,12 +902,17 @@ struct ContentView: View {
     // MARK: - マニュアルパネル
     private var manualPanel: some View {
         VStack(spacing: 2) {
-            presetRow
-            shutterRow
-            isoRow
-            focusRow
-            whiteBalanceRow
+            if manualCollapsed {
+                manualSummaryRow
+            } else {
+                presetRow
+                shutterRow
+                isoRow
+                focusRow
+                whiteBalanceRow
+            }
         }
+        .animation(.easeInOut(duration: 0.2), value: manualCollapsed)
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
@@ -876,7 +922,31 @@ struct ContentView: View {
         .overlay(RoundedRectangle(cornerRadius: 22).stroke(.white.opacity(0.12), lineWidth: 1))
     }
 
-    /// プリセット 5 枠: タップで呼び出し、長押しで保存 / 上書き / 削除
+    /// 折りたたんだマニュアルパネル: 値の要約 1 行だけ（プレビューを隠さない）。タップで開く。
+    private var manualSummaryRow: some View {
+        Button {
+            manualCollapsed = false
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.caption2)
+                Text("SS \(shutterLabel(camera.shutterSeconds)) · ISO \(Int(camera.isoValue))"
+                     + " · \(L("manual.focus")) \(focusLabel(camera.focusPosition))"
+                     + " · WB \(Int(camera.whiteBalanceKelvin))K")
+                    .font(.caption2.monospacedDigit().bold())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Spacer()
+                Image(systemName: "chevron.up")
+                    .font(.caption2.bold())
+            }
+            .foregroundStyle(.white)
+            .padding(.vertical, 5)
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// プリセット 5 枠: タップで呼び出し、長押しで保存 / 上書き / 削除。右端に初期値へ戻す・折りたたみ
     private var presetRow: some View {
         HStack(spacing: 6) {
             Text(L("preset.label"))
@@ -914,6 +984,16 @@ struct ContentView: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 8).padding(.vertical, 5)
                 .background(Color.white.opacity(0.14), in: Capsule())
+            }
+            // 折りたたむ（値の要約 1 行になる）
+            Button {
+                manualCollapsed = true
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.caption2.bold())
+                    .foregroundStyle(.white)
+                    .frame(width: 26, height: 26)
+                    .background(Color.white.opacity(0.14), in: Circle())
             }
         }
         .padding(.bottom, 2)
