@@ -130,6 +130,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
 
     /// シャッター音（Logフレームはアプリが鳴らす音、RAW はシステムの音を抑制できる機種のみ）
     @Published var shutterSoundEnabled: Bool = UserDefaults.standard.object(forKey: "logphoto.shutterSound") as? Bool ?? true
+    private let shutterHaptic = UIImpactFeedbackGenerator(style: .medium)  // シャッターを押したときの触覚
     /// RAW 撮影（システムのシャッター音）を無音にできる機種か。日本など一部の国の機種は false で、
     /// RAW+Log では音を消せない（Log フレームはアプリが鳴らしているので消せる）。
     @Published var shutterSoundSuppressionSupported = false
@@ -1724,6 +1725,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     }
 
     func shutter() {
+        // 純正カメラと同じく、押した瞬間に短い触覚を返す（音の ON/OFF とは無関係。main スレッドで呼ばれる）
+        shutterHaptic.impactOccurred()
         // Logフレームはアプリ側で純正と同じ音を鳴らす（マナーモードでは鳴らない）。
         // RAW はシステムが鳴らすのでここでは鳴らさない。
         if mode == .logFrame, shutterSoundEnabled {
@@ -1733,6 +1736,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         case .logFrame: captureLogPhoto()
         case .rawLog: captureRawLogPhoto()
         }
+        shutterHaptic.prepare() // 次の 1 枚の遅れを減らす
     }
 
     // MARK: - 方式A: Logフレーム保存

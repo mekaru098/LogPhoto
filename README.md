@@ -124,6 +124,7 @@
 - 状態表示（「RAW 準備中」など）はパネルが出ているときパネルの上に出し、隠れないようにした
 - マニュアルパネルを折りたためる（∨ で値の要約 1 行に。タップで開く）
 - v1.17 / v1.18: 新しいアプリアイコン（design/app-icon.svg）
+- build 30: シャッターを押した瞬間に触覚（UIImpactFeedbackGenerator .medium）。音の ON/OFF とは無関係
 
 ## v1.16 の変更
 - RAW+Log の 48MP は Apple ProRAW で撮る（通常の Bayer RAW は 48MP を指定しても 12MP しか出ない）。
