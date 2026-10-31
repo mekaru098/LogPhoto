@@ -1030,6 +1030,8 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                     // 入力に加えた後・commit の前にフォーマットと色空間を決める（同じトランザクション内）
                     hasLog = configureFormat(target)
                     captureDevice = target
+                    // commit（約 0.4 秒）の間に届くコマは全部捨てる。commit 後に 0.25 秒へ縮める
+                    ignoreFramesUntil = CACurrentMediaTime() + 2.0
                 } else {
                     // 追加できなければ元の入力へ戻す（入力ゼロで captureDevice だけ進むのを防ぐ）
                     dlog("lens", "canAddInput=false: \(target.localizedName)。元の入力へ戻す")
@@ -2160,24 +2162,32 @@ extension LogPhotoCamera: AVCaptureVideoDataOutputSampleBufferDelegate {
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        // レンズ切替直後の数フレームは色空間が整う前のことがあるので捨てる（前のフレームを保持）
-        if CACurrentMediaTime() < ignoreFramesUntil { return }
-        bufferLock.lock()
-        latestBuffer = buffer
-        bufferLock.unlock()
-        // フレームサイズと画素形式の変化だけを公開する（タップAFの座標変換と検証表示に使う）
         let w = CVPixelBufferGetWidth(buffer)
         let h = CVPixelBufferGetHeight(buffer)
         let pixelFormat = CVPixelBufferGetPixelFormatType(buffer)
+        // 入力を付け替えた直後のコマは、接続の回転（縦向き 90°）が掛かる前の横長 3840x2160 で届く。
+        // このアプリは常に縦向きなので、横長のコマは回転前のものしかない → 保持せず捨てる
+        // （時間で捨てるだけだと、切替中に届いた横長のコマが残って横向きの写真になっていた）。
+        let unrotated = w > h
+        // レンズ切替直後の数フレームは色空間が整う前のことがあるので捨てる（前のフレームを保持）
+        let settling = CACurrentMediaTime() < ignoreFramesUntil
+        if !unrotated, !settling {
+            bufferLock.lock()
+            latestBuffer = buffer
+            bufferLock.unlock()
+        }
+        // フレームサイズと画素形式の変化だけを公開する（タップAFの座標変換と検証表示に使う）
         if w != lastFrameWidth || h != lastFrameHeight || pixelFormat != lastFramePixelFormat {
             lastFrameWidth = w
             lastFrameHeight = h
             lastFramePixelFormat = pixelFormat
             let code = fourCharCode(pixelFormat)
-            dlog("session", "フレーム受信 \(code) \(w)x\(h)")
-            DispatchQueue.main.async {
-                self.previewFrameSize = CGSize(width: w, height: h)
-                self.frameFormatCode = code
+            dlog("session", "フレーム受信 \(code) \(w)x\(h)\(unrotated ? "（回転前・破棄）" : settling ? "（切替直後・破棄）" : "")")
+            if !unrotated {
+                DispatchQueue.main.async {
+                    self.previewFrameSize = CGSize(width: w, height: h)
+                    self.frameFormatCode = code
+                }
             }
         }
     }
