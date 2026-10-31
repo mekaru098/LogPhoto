@@ -771,7 +771,7 @@ struct ContentView: View {
                     .colorScheme(.dark)
                 }
 
-                // RAW+Log は解像度（12MP / 48MP）、Log フレームは TIFF の階調（8bit / 10bit）を切り替える
+                // RAW→Log現像 は解像度（12MP / 48MP）、Log フレームはフレームレートと TIFF の階調（8bit / 10bit）を切り替える
                 if camera.mode == .rawLog {
                     Button {
                         camera.setRawHighResolution(!camera.rawHighResolution)
@@ -784,6 +784,20 @@ struct ContentView: View {
                                         in: Capsule())
                     }
                 } else {
+                    // フレームレート（タップで 24 → 25 → 30 → 60 → 24）。低いほど長いシャッターが使える
+                    Button {
+                        let rates = LogPhotoCamera.logFrameRates
+                        let i = rates.firstIndex(of: camera.logFrameRate) ?? 0
+                        camera.setLogFrameRate(rates[(i + 1) % rates.count])
+                    } label: {
+                        Text("\(camera.logFrameRate)fps")
+                            .font(.caption.bold().monospacedDigit())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8).padding(.vertical, 7)
+                            .background(Color.white.opacity(0.14), in: Capsule())
+                    }
+                    .opacity(camera.logUnsupportedDevice ? 0.4 : 1)
+                    .disabled(camera.logUnsupportedDevice)
                     Button {
                         camera.setLogFrame10Bit(!camera.logFrame10Bit)
                     } label: {

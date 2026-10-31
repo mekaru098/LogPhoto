@@ -39,9 +39,10 @@ import UIKit
 ///
 /// 2つの撮影モード:
 /// - 方式A (.logFrame): Apple Log のビデオフレームをシャッター時に静止画保存
-/// - 方式B (.rawLog): Bayer RAW で撮影し、(1) DNG をそのまま保存、
-///   (2) RAW を現像して Log カーブ（近似）で変換した画像も保存する
-/// 方式Bの Log 変換は Apple Log の厳密な OETF ではなく近似カーブ。
+/// - 方式B (.rawLog、表示名「RAW→Log現像」): RAW で撮影し、(1) DNG をそのまま保存、
+///   (2) RAW をシーンリニアに現像し、BT.2020 に変換して Apple Log の OETF（公式の式）で
+///   符号化した画像も保存する。カーブと色域は Apple Log と同じ定義だが、現像はカメラの
+///   動画処理とは別なので、動画の Apple Log と完全に同じ値にはならない（だから「現像」と呼ぶ）。
 final class LogPhotoCamera: NSObject, ObservableObject {
 
     enum CaptureMode: String, CaseIterable, Identifiable {
@@ -67,6 +68,11 @@ final class LogPhotoCamera: NSObject, ObservableObject {
     @Published var rawMegapixels: Double = 0   // 現在の写真サイズ（検証表示用）
     @Published var rawIsProRAW = false          // RAW+Log が Apple ProRAW で撮るか（48MP 設定時）
     @Published var logFrame10Bit: Bool = UserDefaults.standard.object(forKey: "logphoto.log10bit") as? Bool ?? true
+    /// Log フレームのフレームレート。低いほどシャッターを長くでき、暗所に強い。
+    static let logFrameRates = [24, 25, 30, 60]
+    @Published var logFrameRate: Int = UserDefaults.standard.object(forKey: "logphoto.logFPS") as? Int ?? 30
+    /// sessionQueue 用の控え
+    private var logFPSStore: Int = UserDefaults.standard.object(forKey: "logphoto.logFPS") as? Int ?? 30
     @Published var statusText = L("status.preparing")
     @Published var mode: CaptureMode = .logFrame
     /// 表示倍率（レンズ基準: 広角 = 1x）。管理値 desiredZoom をそのまま公開する。
@@ -490,14 +496,70 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         return [virtualDevice].compactMap { $0 }
     }
 
+    /// Log 用フォーマット: Apple Log 対応の中で解像度が最大のもの（iPhone 16 Pro では 4K）。
+    /// 同じ解像度に 30fps 用・120fps 用などが並ぶので、選んだフレームレートに対応するものを優先し、
+    /// その中では最大フレームレートが低いもの（高速撮影用でない普通の形式）を選ぶ。
     private func bestLogFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
-        device.formats
-            .filter { $0.supportedColorSpaces.contains(.appleLog) }
-            .max { a, b in
-                let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
-                let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
-                return Int(da.width) * Int(da.height) < Int(db.width) * Int(db.height)
-            }
+        let logFormats = device.formats.filter { $0.supportedColorSpaces.contains(.appleLog) }
+        func area(_ f: AVCaptureDevice.Format) -> Int {
+            let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            return Int(d.width) * Int(d.height)
+        }
+        guard let maxArea = logFormats.map(area).max() else { return nil }
+        let largest = logFormats.filter { area($0) == maxArea }
+        let fps = Double(logFPSStore)
+        let supportsFPS = largest.filter { supportsFrameRate($0, fps) }
+        let pool = supportsFPS.isEmpty ? largest : supportsFPS
+        return pool.min { maxFrameRate($0) < maxFrameRate($1) }
+    }
+
+    private func maxFrameRate(_ f: AVCaptureDevice.Format) -> Double {
+        f.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+    }
+
+    private func supportsFrameRate(_ f: AVCaptureDevice.Format, _ fps: Double) -> Bool {
+        f.videoSupportedFrameRateRanges.contains { $0.minFrameRate - 0.01 <= fps && fps <= $0.maxFrameRate + 0.01 }
+    }
+
+    /// Log フレームのフレームレートを固定する（lockForConfiguration 中に呼ぶ）。
+    /// 範囲外の値を入れると例外で落ちるので、対応しているときだけ設定する。戻り値: 設定できたか。
+    @discardableResult
+    private func applyLogFrameRate(_ device: AVCaptureDevice) -> Bool {
+        let fps = logFPSStore
+        let format = device.activeFormat
+        guard supportsFrameRate(format, Double(fps)) else {
+            device.activeVideoMinFrameDuration = .invalid
+            device.activeVideoMaxFrameDuration = .invalid
+            dlog("fps", "\(fps)fps はこの形式で使えない ranges=\(format.videoSupportedFrameRateRanges.map { "\($0.minFrameRate)-\($0.maxFrameRate)" })")
+            return false
+        }
+        let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
+        device.activeVideoMinFrameDuration = duration
+        device.activeVideoMaxFrameDuration = duration
+        return true
+    }
+
+    /// シャッタースピードの上限（秒）。Log フレームでは 1 フレームの時間を超えられない。
+    private func maxShutterSeconds(_ format: AVCaptureDevice.Format) -> Double {
+        let base = min(format.maxExposureDuration.seconds, 2.0)
+        guard mode == .logFrame else { return base }
+        return min(base, 1.0 / Double(logFPSStore))
+    }
+
+    /// Log フレームのフレームレートを変える。フォーマットの選び直しも含めて再構成する。
+    func setLogFrameRate(_ fps: Int) {
+        logFrameRate = fps
+        UserDefaults.standard.set(fps, forKey: "logphoto.logFPS")
+        dlog("fps", "Log フレームのフレームレート → \(fps)fps")
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.logFPSStore = fps
+            guard self.mode == .logFrame, let device = self.captureDevice else { return }
+            self.applyDeviceConfiguration(device)
+            let applied = device.activeVideoMinFrameDuration.isValid
+                && abs(device.activeVideoMinFrameDuration.seconds - 1.0 / Double(fps)) < 0.0005
+            self.setStatus(applied ? L("status.fpsSet", fps, fps) : L("status.fpsUnsupported", fps))
+        }
     }
 
     /// RAW 用フォーマット: 写真解像度が最大で、Log 以外の色空間を持つもの。
@@ -754,6 +816,15 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                             .first(where: { $0 != .appleLog }) ?? format.supportedColorSpaces.first {
                     device.activeColorSpace = colorSpace
                 }
+                if targetMode == .logFrame {
+                    let fpsOK = applyLogFrameRate(device)
+                    let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                    dlog("fps", "Log 形式 \(d.width)x\(d.height) max=\(Int(maxFrameRate(format)))fps 指定=\(logFPSStore)fps 適用=\(fpsOK) device=\(device.localizedName)")
+                } else {
+                    // RAW 側はフレームレートを既定に戻す
+                    device.activeVideoMinFrameDuration = .invalid
+                    device.activeVideoMaxFrameDuration = .invalid
+                }
                 // activeFormat を設定するとセッションは inputPriority に戻る
                 rawUsesPhotoPreset = false
             }
@@ -800,7 +871,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         let isoLo = Double(rangeFormat.minISO)
         let isoHi = Double(rangeFormat.maxISO)
         let ssLo = rangeFormat.minExposureDuration.seconds
-        let ssHi = min(rangeFormat.maxExposureDuration.seconds, 2.0)
+        let ssHi = maxShutterSeconds(rangeFormat)
         // マニュアル中はユーザーの値を維持し（新レンズの範囲にクランプ）、
         // オート中だけデバイスの現在値をスライダーに反映する
         let keepManual = manualMode
@@ -1311,7 +1382,7 @@ final class LogPhotoCamera: NSObject, ObservableObject {
         // 範囲は切替先レンズのフォーマットから取る（公開中の範囲は前のレンズのものかもしれない）
         let format = device.activeFormat
         let ssLo = format.minExposureDuration.seconds
-        let ssHi = min(format.maxExposureDuration.seconds, 2.0)
+        let ssHi = maxShutterSeconds(format)
         let seconds = min(max(shutterSeconds, ssLo), ssHi)
         let iso = Float(min(max(isoValue, Double(format.minISO)), Double(format.maxISO)))
         do {

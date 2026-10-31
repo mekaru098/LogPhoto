@@ -50,7 +50,7 @@ enum Strings {
     static let table: [String: T] = [
         // --- モード / 形式 ---
         "mode.logFrame": [.ja: "Logフレーム", .en: "Log frame", .zh: "Log 帧", .it: "Fotogramma Log"],
-        "mode.rawLog": [.ja: "RAW+Log", .en: "RAW+Log", .zh: "RAW+Log", .it: "RAW+Log"],
+        "mode.rawLog": [.ja: "RAW→Log現像", .en: "RAW→Log develop", .zh: "RAW→Log 显影", .it: "RAW→Log sviluppo"],
         "lut.none": [.ja: "なし", .en: "None", .zh: "无", .it: "Nessuna"],
         // --- 上部 ---
         "badge.appleLog": [.ja: "APPLE LOG", .en: "APPLE LOG", .zh: "APPLE LOG", .it: "APPLE LOG"],
@@ -98,7 +98,7 @@ enum Strings {
         "settings.lensManual": [.ja: "マニュアル", .en: "Manual", .zh: "手动", .it: "Manuale"],
         "settings.advanced": [.ja: "詳細設定", .en: "Advanced", .zh: "高级设置", .it: "Avanzate"],
         "settings.language": [.ja: "言語", .en: "Language", .zh: "语言", .it: "Lingua"],
-        "settings.logUnavailable": [.ja: "この機種は Apple Log 非対応のため RAW+Log のみ", .en: "Apple Log is not supported on this device; RAW+Log only", .zh: "此机型不支持 Apple Log，仅可使用 RAW+Log", .it: "Apple Log non supportato su questo dispositivo; solo RAW+Log"],
+        "settings.logUnavailable": [.ja: "この機種は Apple Log 非対応のため RAW→Log現像 のみ", .en: "Apple Log is not supported on this device; RAW→Log develop only", .zh: "此机型不支持 Apple Log，仅可使用 RAW→Log 显影", .it: "Apple Log non supportato su questo dispositivo; solo RAW→Log sviluppo"],
         // --- マニュアル / プリセット ---
         "preset.label": [.ja: "プリセット", .en: "Presets", .zh: "预设", .it: "Preset"],
         "preset.hint": [.ja: "長押しで保存", .en: "Hold to save", .zh: "长按保存", .it: "Tieni premuto per salvare"],
@@ -123,7 +123,9 @@ enum Strings {
         "status.logUnsupportedLens": [.ja: "このレンズは Apple Log 非対応です（%@）", .en: "This lens does not support Apple Log (%@)", .zh: "此镜头不支持 Apple Log（%@）", .it: "Questo obiettivo non supporta Apple Log (%@)"],
         "status.rawPreparing": [.ja: "RAW を準備中…（%@）", .en: "Preparing RAW… (%@)", .zh: "正在准备 RAW…（%@）", .it: "Preparazione RAW… (%@)"],
         "status.teleFallback": [.ja: "望遠の最短距離より近いので広角のクロップに切り替えました", .en: "Too close for the telephoto; switched to the wide camera's crop", .zh: "距离小于长焦最近对焦距离，已切换为广角裁切", .it: "Troppo vicino per il tele; passato al ritaglio del grandangolo"],
-        "status.rawReady": [.ja: "RAW+Log の準備ができました", .en: "RAW+Log ready", .zh: "RAW+Log 已就绪", .it: "RAW+Log pronto"],
+        "status.rawReady": [.ja: "RAW→Log現像 の準備ができました", .en: "RAW→Log develop ready", .zh: "RAW→Log 显影已就绪", .it: "RAW→Log sviluppo pronto"],
+        "status.fpsSet": [.ja: "Log フレーム: %d fps（シャッターは最長 1/%d 秒）", .en: "Log frame: %d fps (slowest shutter 1/%d s)", .zh: "Log 帧：%d fps（快门最慢 1/%d 秒）", .it: "Fotogramma Log: %d fps (otturatore più lento 1/%d s)"],
+        "status.fpsUnsupported": [.ja: "このレンズの Log 形式は %d fps に対応していません（既定のまま）", .en: "This lens's Log format does not support %d fps (kept default)", .zh: "此镜头的 Log 格式不支持 %d fps（保持默认）", .it: "Il formato Log di questo obiettivo non supporta %d fps (predefinito)"],
         "status.rawUnavailable": [.ja: "この構成では RAW が使えませんでした", .en: "RAW is not available in this configuration", .zh: "当前配置无法使用 RAW", .it: "RAW non disponibile in questa configurazione"],
         "status.macro": [.ja: "マクロ（超広角）: 被写体に近づけます", .en: "Macro (ultra wide): you can get close", .zh: "微距（超广角）：可以靠近拍摄", .it: "Macro (ultra grandangolo): puoi avvicinarti"],
         "status.lutAdded": [.ja: "LUT「%@」を追加しました", .en: "LUT \"%@\" added", .zh: "已添加 LUT“%@”", .it: "LUT \"%@\" aggiunta"],
