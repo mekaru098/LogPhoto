@@ -1030,7 +1030,6 @@ final class LogPhotoCamera: NSObject, ObservableObject {
                     // 入力に加えた後・commit の前にフォーマットと色空間を決める（同じトランザクション内）
                     hasLog = configureFormat(target)
                     captureDevice = target
-                    ignoreFramesUntil = CACurrentMediaTime() + 0.25
                 } else {
                     // 追加できなければ元の入力へ戻す（入力ゼロで captureDevice だけ進むのを防ぐ）
                     dlog("lens", "canAddInput=false: \(target.localizedName)。元の入力へ戻す")
@@ -1044,6 +1043,12 @@ final class LogPhotoCamera: NSObject, ObservableObject {
             }
             session.commitConfiguration()
             applyVideoRotation()
+            if deviceChanged {
+                // 新しい入力の最初のコマは回転（縦向き）も色空間も整う前のことがあり、横長 3840x2160 のまま届く。
+                // commit は 0.4 秒ほどかかるので、待ち時間の起点は commit の後にする（前は addInput 時点から
+                // 0.25 秒で、commit 前に切れて横長のコマが latestBuffer に残り、直後の撮影が横向きで保存された）
+                ignoreFramesUntil = CACurrentMediaTime() + 0.25
+            }
             finishDeviceConfiguration(activeDevice, hasLogFormat: hasLog)
             dlog("lens", "reconcile 完了: active=\(activeDevice.localizedName) logFormat=\(hasLog) appleLog=\(activeDevice.activeColorSpace == .appleLog) running=\(session.isRunning)")
         }
